@@ -1,0 +1,45 @@
+name: Telegram bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      WATERMARK_TEXT: ${{ vars.WATERMARK_TEXT || '@NotesHubX' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Any new messages?
+        id: check
+        run: python3 telegram_bot.py check
+
+      - name: Install OCR and fonts
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-eng fonts-liberation
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.has_updates == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python packages
+        if: steps.check.outputs.has_updates == 'true'
+        run: pip install -q -r requirements.txt
+
+      - name: Make PDFs and reply
+        if: steps.check.outputs.has_updates == 'true'
+        run: python telegram_bot.py poll
