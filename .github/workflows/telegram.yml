@@ -1,9 +1,17 @@
 name: Telegram bot
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      hook_url:
+        description: "Vercel webhook to reconnect after the run (filled in automatically)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
 
 concurrency:
   group: telegram-bot
@@ -12,23 +20,27 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      WATERMARK_TEXT: ${{ vars.WATERMARK_TEXT || '@NotesHubX' }}
+      LOG_CHAT_ID: ${{ secrets.LOG_CHAT_ID }}
+      PUBLIC_BOT: "false"
+      QUIET_SECONDS: "45"
     steps:
       - uses: actions/checkout@v4
 
       - name: Any new messages?
         id: check
+        env:
+          HOOK_URL: ${{ github.event.inputs.hook_url }}
         run: python3 telegram_bot.py check
 
       - name: Install OCR and fonts
         if: steps.check.outputs.has_updates == 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-eng fonts-liberation
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin fonts-liberation fonts-dejavu-core
 
       - uses: actions/setup-python@v5
         if: steps.check.outputs.has_updates == 'true'
@@ -43,3 +55,9 @@ jobs:
       - name: Make PDFs and reply
         if: steps.check.outputs.has_updates == 'true'
         run: python telegram_bot.py poll
+
+      - name: Reconnect Vercel
+        if: always()
+        env:
+          HOOK_URL: ${{ steps.check.outputs.hook_url }}
+        run: python3 telegram_bot.py arm
