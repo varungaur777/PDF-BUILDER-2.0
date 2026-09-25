@@ -1,0 +1,13 @@
+{
+  "channel_name": "NotesHubX",
+  "channel_link": "https://t.me/NotesHubX",
+  "header_title": "Staff Selection Commission",
+  "watermark": "@NotesHubX",
+  "watermark_color": "#DB3333",
+  "watermark_opacity": 0.13,
+  "question_color": "#B3261E",
+  "option_color": "#1B1B1B",
+  "answer_color": "#1F4E9E",
+  "accent_color": "#1F4E9E",
+  "font_size": 9.4
+}

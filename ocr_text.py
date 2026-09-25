@@ -28,6 +28,7 @@ class OcrResult:
     plain: str          # plain text (for comparing passages)
     conf: float
     reason: str = ""
+    min_conf: float = 100.0
 
 
 def _prep(blob, scale=None):
@@ -92,10 +93,35 @@ def _stroke_width(dark_box):
 
 def _letter_order(im):
     """Options like 'B – A – C – D' confuse normal OCR; read letters only."""
+    free = pytesseract.image_to_string(im, config="--psm 7").strip()
+    letters = re.findall(r"[A-Za-z]", free)
+    if len(re.findall(r"[A-H]", free)) < 3 or len(re.findall(r"[A-H]", free)) < 0.6 * len(letters):
+        return None                                   # not an order option (figure, Hindi, words…)
     t = pytesseract.image_to_string(im, config="--psm 7 -c tessedit_char_whitelist=ABCDEFGH").strip()
     if 3 <= len(t) <= 8 and len(set(t)) == len(t):
         return t
     return None
+
+
+_HIN = None
+
+
+def _hindi_available():
+    global _HIN
+    if _HIN is None:
+        try:
+            _HIN = "hin" in pytesseract.get_languages(config="")
+        except Exception:
+            _HIN = False
+    return _HIN
+
+
+def has_devanagari(blob):
+    """True if the image contains Hindi (Devanagari) text."""
+    if not _hindi_available():
+        return False
+    t = pytesseract.image_to_string(_prep(blob, 2), lang="eng+hin", config="--psm 6")
+    return len(re.findall(r"[\u0900-\u097F]", t)) >= 3
 
 
 def ocr_image(blob, single_line=False):
@@ -105,6 +131,9 @@ def ocr_image(blob, single_line=False):
         r2 = _ocr_image(blob, allow_bold=not single_line, scale=2 if SCALE != 2 else 4)
         if r2.ok and (not r.ok or r2.conf > r.conf):
             r = r2
+    # Hindi / bilingual text can't be typed back correctly -> keep the original picture
+    if r.ok and (r.conf < 93 or r.min_conf < 60) and has_devanagari(blob):
+        return OcrResult(False, "", "", r.conf, "hindi")
     if single_line and (not r.ok or r.conf < 88 or re.fullmatch(r"[A-H\s\-–—=]{5,}", r.plain or "")):
         letters = _letter_order(_prep(blob))
         if letters:
@@ -248,4 +277,5 @@ def _ocr_image(blob, single_line=False, allow_bold=True, scale=None):
     markup = re.sub(r"(<br/>)+$", "", markup)
     markup = re.sub(r"\s+[‘’'`|]$", "", markup)   # stray tick after a trailing blank
     markup = re.sub(r"^([a-z])", lambda m: m.group(1).upper(), markup)
-    return OcrResult(True, markup, " ".join(plain), conf)
+    min_conf = min((w["conf"] for w in words), default=0.0)
+    return OcrResult(True, markup, " ".join(plain), conf, "", min_conf)

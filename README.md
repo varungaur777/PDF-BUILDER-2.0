@@ -1,14 +1,37 @@
-# SSC Question Paper Bot
+# SSC Answer Key Bot (public)
 
-Send your SSC response sheet page to a Telegram bot and get back a clean two-column PDF:
+Anyone can DM the bot their SSC response sheet page(s) and get back:
+- 📄 one PDF per section (Q → options (a)–(d) → official answer), any number of sections
+- 📘 the full paper in one PDF
+- 📊 a marks calculation photo (+1 / −0.25, section-wise)
 
-**Q.1** → options **(a) (b) (c) (d)** → **Answer: (x)** (SSC's official key), watermarked **@NotesHubX**.
+File names: `12 Sep 2026 (English Language and Comprehension) (Shift-1).pdf`, full paper `12 Sep 2026 (<Exam name>) (Shift-1).pdf`.
+English questions are typed out with OCR; figures, maths layouts and Hindi (or bilingual) questions/options are kept as the original picture.
+Every request is copied to the team's log channel (user name, @username, id, the files and the outputs). The bot tells users this in /start.
 
-SSC shows every question as a picture, so the script reads them with OCR (Tesseract). Blanks (`______`), underlined words and bold words are kept. Figures, fractions and tables are kept as the original picture. Cloze passages print once, followed by their questions.
+## Commands
 
-This repo is **public**, and it is safe to keep it that way: your files never enter the repo. The bot downloads them into a temporary folder on GitHub's machine, makes the PDF, sends it back on Telegram, and prints no names, roll numbers or links in the logs.
+| Who | Send | Gets |
+|---|---|---|
+| Anyone (DM) | the file(s), no caption | section PDFs + full paper + marks photo |
+| | caption `/marks` | marks photo only |
+| | caption `/full` | full paper only |
+| | caption `/sections` | section PDFs only |
+| | caption `/report` | analysis PDF (your wrong answers in red) |
+| | words `yours` / `hide` / `nowm` | show your answer / no name & roll no. / no watermark |
+| Team (ids in `TELEGRAM_CHAT_ID`) | `/settings` | all settings |
+| | `/set <name> <value>` | e.g. `/set question_color #1E7D34`, `/set watermark off`, `/set channel_link t.me/NotesHubX` |
+| | `/reset` | back to defaults |
 
----
+Settings: `channel_name`, `channel_link` (footer + marks photo), `header_title`, `watermark`, `watermark_color`, `watermark_opacity`, `question_color`, `option_color`, `answer_color`, `accent_color`, `font_size`. They are saved in `settings.json` (committed back to the repo by the bot).
+
+## Secrets (repo → Settings → Secrets and variables → Actions)
+
+| Name | Value |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | team member user ids, comma separated (send /start to the bot to see your id) |
+| `LOG_CHAT_ID` | id of the log channel (add the bot there as admin; post /id in it to get the id) |
 
 ## 1. Put the code on GitHub (phone is fine)
 
@@ -34,7 +57,7 @@ The bot only answers the chat ids in `TELEGRAM_CHAT_ID`; everyone else is refuse
 
 1. Chrome → open the response sheet → ⋮ → ↓ download. Do it for each part. The file name doesn't matter (`a.txt`, `b.txt`, `ViewCandResponse3.mhtml`…) — the bot reads which part it is from inside the file.
 2. Send the file(s) to the bot. Send PART-A, PART-B and PART-C together (or one after another within 2 minutes) and you get **one PDF** with all sections in order A → B → C, each starting on a new page. The bot waits 2 minutes after your last file before starting, so it doesn't split them. You can also paste the response sheet link, but SSC may block GitHub's servers, so the file is more reliable.
-3. The bot checks every 5 minutes (GitHub can start it a few minutes late). For an instant check: **Actions → Telegram bot → Run workflow**.
+3. With the Vercel hook (below) the PDF arrives in 2–3 minutes. Without it, an hourly run picks files up; for an instant check use **Actions → Telegram bot → Run workflow**.
 
 Caption words:
 
@@ -45,10 +68,35 @@ Caption words:
 | `nowm` | no watermark |
 | `report` | score report instead of the paper (+1 / −0.25 by section, wrong answers in red) |
 
+## Instant replies with Vercel (recommended)
+
+GitHub's own schedule can start hours late. With a tiny free Vercel function, Telegram calls Vercel the moment you send a file, Vercel starts the GitHub run immediately, and the PDF arrives in about 2–3 minutes. The hourly schedule stays as a safety net.
+
+1. Make a new GitHub repo `ssc-bot-hook` with `api/telegram.js` and `package.json` (from the zip).
+2. GitHub token: Settings → Developer settings → Fine-grained tokens → only `PDF-BUILDER-2.0` → **Actions: Read and write**.
+3. vercel.com → Add New → Project → import `ssc-bot-hook` → Environment Variables `TELEGRAM_BOT_TOKEN`, `GITHUB_TOKEN`, `GITHUB_REPO` (= `varungaur777/PDF-BUILDER-2.0`) → Deploy.
+4. Open `https://<project>.vercel.app/api/telegram` once. It connects the bot and shows ✅.
+
+## Faster: run it on your own server (replies in ~1 minute)
+
+GitHub often starts scheduled runs late (sometimes by hours). On a free Oracle Cloud server the bot runs 24x7 and answers within about a minute of your last file.
+
+1. Create an Ubuntu server (Oracle Cloud → Compute → Instances → Create → **Canonical Ubuntu**, shape **Ampere A1.Flex** or **E2.1.Micro**).
+2. SSH in and run:
+   ```
+   git clone https://github.com/varungaur777/PDF-BUILDER-2.0.git
+   cd PDF-BUILDER-2.0
+   bash server-setup.sh
+   ```
+   Enter the same bot token and chat id(s) as the GitHub secrets.
+3. On GitHub: **Actions → Telegram bot → ⋯ → Disable workflow** — only one copy of the bot may run.
+
+Update later: `cd PDF-BUILDER-2.0 && bash server-setup.sh` · Logs: `sudo docker compose logs -f --tail 50`
+
 ## Settings
 
 - **Watermark:** `@NotesHubX` by default. To change it: **Settings → Secrets and variables → Actions → Variables → New repository variable**, name `WATERMARK_TEXT`.
-- **Check interval:** the `cron` line in `.github/workflows/telegram.yml`.
+- **Safety-net interval:** the `cron` line in `.github/workflows/telegram.yml` (hourly).
 - GitHub pauses scheduled workflows after 60 days with no commits — re-enable from the Actions tab.
 
 ## Don't

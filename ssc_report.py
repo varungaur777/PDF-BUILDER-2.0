@@ -43,8 +43,9 @@ from PIL import Image as PILImage
 class Option:
     number: int
     colour: str            # green / red / yellow / ""
-    img: str | None = None  # image key in the image store
+    img: str | None = None  # first image key in the image store
     text: str = ""
+    imgs: list = field(default_factory=list)   # all images (e.g. English + Hindi)
 
 
 @dataclass
@@ -56,6 +57,7 @@ class Question:
     q_img: str | None
     q_text: str
     options: list = field(default_factory=list)
+    q_imgs: list = field(default_factory=list)  # all question images (e.g. English + Hindi)
 
     @property
     def correct(self):
@@ -243,7 +245,7 @@ def parse_questions(soup, default_section):
             continue
         m = re.search(r"(\d+)", link.get_text())
         qno = int(m.group(1)) if m else len(questions) + 1
-        q_img, q_text, opts = None, "", []
+        q_img, q_text, opts, q_imgs = None, "", [], []
         for tr in el.find_all("tr"):
             if tr.find_parent("table") is not el:
                 continue
@@ -251,17 +253,17 @@ def parse_questions(soup, default_section):
             if len(tds) < 2 or tr.find("a", string=challenge_re):
                 continue
             content = tds[-1]
-            img = content.find("img")
-            src = img.get("src") if img else None
+            srcs = [i.get("src") for i in content.find_all("img") if i.get("src")]
+            src = srcs[0] if srcs else None
             text = clean(content.get_text())
             if "Q.No" in tds[0].get_text():
-                q_img, q_text = src, text
+                q_img, q_text, q_imgs = src, text, srcs
             elif src or text:
-                opts.append(Option(number=len(opts) + 1, colour=cell_colour(tds[0]), img=src, text=text))
+                opts.append(Option(number=len(opts) + 1, colour=cell_colour(tds[0]), img=src, text=text, imgs=srcs))
         qid = question_id_from(q_img, f"{section[:6]}-Q{qno}")
         questions.append(Question(qno=qno, section=section, question_id=qid,
                                   challenge_url=link.get("href", ""), q_img=q_img,
-                                  q_text=q_text, options=opts))
+                                  q_text=q_text, options=opts, q_imgs=q_imgs))
     return questions
 
 
@@ -555,7 +557,7 @@ def run_ocr(questions, store, jobs=0):
     from multiprocessing import Pool
     todo, seen = [], set()
     for q in questions:
-        for key, single in [(q.q_img, False)] + [(o.img, True) for o in q.options]:
+        for key, single in [(k, False) for k in q.q_imgs] + [(k, True) for o in q.options for k in o.imgs]:
             if key and key not in seen and store.get(key):
                 seen.add(key)
                 todo.append((key, store.get(key), single))
@@ -567,6 +569,32 @@ def run_ocr(questions, store, jobs=0):
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+
+def section_title(name):
+    """'PART-C (English Language and Comprehension)' -> 'English Language and Comprehension'."""
+    m = re.match(r"\s*PART-[A-Z]+\s*\((.*)\)\s*$", name or "", re.I)
+    return (m.group(1) if m else name or "Section").strip()
+
+
+def out_name(cand, middle):
+    """File name: Date (Section name / Exam name) (Shift)  e.g. 12 Sep 2026 (English Language) (Shift-1).pdf"""
+    date = (cand.test_date or "").strip()
+    date = " ".join(w.capitalize() if w.isalpha() else w for w in date.split())
+    m = re.search(r"Shift[\s-]*\d+", cand.shift or "", re.I)
+    shift = m.group(0).replace(" ", "-").title().replace("Shift--", "Shift-") if m else (cand.shift or "").strip()
+    parts = [date, f"({middle})" if middle else "", f"({shift})" if shift else ""]
+    name = " ".join(p for p in parts if p)
+    name = re.sub(r'[\\/:*?"<>|]+', "-", name)
+    return re.sub(r"\s+", " ", name).strip() or "SSC paper"
+
+
+def unique_path(folder, base, used):
+    name, n = base, 2
+    while name.lower() in used:
+        name, n = f"{base} {n}", n + 1
+    used.add(name.lower())
+    return os.path.join(folder, name + ".pdf")
+
 
 def gather_inputs(args):
     files = list(args.files)
@@ -594,6 +622,9 @@ def main():
     ap.add_argument("--watermark", default="", help="paper: faint diagonal text on every page")
     ap.add_argument("--footer", default="", help="paper: small text at the bottom-left of every page")
     ap.add_argument("--jobs", type=int, default=0, help="parallel OCR workers (default: all CPUs)")
+    ap.add_argument("--make", default="sections,full,marks",
+                    help="paper style outputs, comma separated: sections, full, marks (default all three)")
+    ap.add_argument("--settings", default="", help="settings.json with colours / watermark / channel (default: next to this script)")
     ap.add_argument("--summary", default="", help="append a Markdown summary to this file (GitHub step summary)")
     args = ap.parse_args()
 
@@ -632,7 +663,7 @@ def main():
             errors.append(f"{src}: roll number {c.roll_no} differs from {cand.roll_no} — skipped")
             continue
         qs = parse_questions(soup, default_section=os.path.basename(src))
-        keys = [k for q in qs for k in [q.q_img] + [o.img for o in q.options] if k]
+        keys = [k for q in qs for k in q.q_imgs + [i for o in q.options for i in o.imgs] if k]
         missing = sum(1 for k in keys if not store.get(k))
         if not qs:
             errors.append(f"{os.path.basename(src)}: no questions found — is this an SSC response sheet page?")
@@ -673,17 +704,50 @@ def main():
             w.writerow([q.section, q.qno, q.question_id, ",".join(map(str, q.chosen)),
                         ",".join(map(str, q.correct)), q.status, q_marks(q, args.pos, args.neg), q.challenge_url])
 
+    manifest = []
     if args.style == "report":
+        pdf_path = os.path.join(args.out_dir, out_name(cand, cand.exam or "Exam") + " - Score Analysis.pdf")
         build_pdf(pdf_path, cand, questions, sections, tot, store, args.pos, args.neg, args.cards)
+        manifest.append({"kind": "report", "path": pdf_path, "title": "Score report"})
     else:
-        from paper_pdf import build_paper
-        ocr = run_ocr(questions, store, args.jobs)
-        fails = [k for k, r in ocr.items() if not r.ok]
-        print(f"OCR: {len(ocr) - len(fails)} of {len(ocr)} images read as text, {len(fails)} kept as pictures")
-        pdf_path = os.path.join(args.out_dir, stem + "_paper.pdf")
-        build_paper(pdf_path, cand, questions, store, ocr, show_yours=args.show_yours,
-                    hide_candidate=args.hide_candidate, watermark=args.watermark,
-                    footer_text=args.footer, pos=args.pos, neg=args.neg)
+        if args.settings:
+            os.environ["SETTINGS_FILE"] = args.settings
+        import settings as settings_mod
+        st = settings_mod.load()
+        if args.watermark:
+            st["watermark"] = "" if args.watermark.lower() in ("none", "off") else args.watermark
+        make = {m.strip() for m in args.make.split(",") if m.strip()}
+        if make & {"sections", "full"}:
+            from paper_pdf import build_paper
+            ocr = run_ocr(questions, store, args.jobs)
+            fails = [k for k, r in ocr.items() if not r.ok]
+            hindi = sum(1 for r in ocr.values() if r.reason == "hindi")
+            print(f"OCR: {len(ocr) - len(fails)} of {len(ocr)} images read as text, {len(fails)} kept as pictures"
+                  + (f" ({hindi} Hindi)" if hindi else ""))
+            common = dict(show_yours=args.show_yours, hide_candidate=args.hide_candidate, settings=st,
+                          footer_text=args.footer, pos=args.pos, neg=args.neg)
+            used = set()
+            multi = len(sections_order) > 1
+            if "sections" in make or not multi:
+                for sec in sections_order:
+                    qs = [q for q in questions if q.section == sec]
+                    path = unique_path(args.out_dir, out_name(cand, section_title(sec)), used)
+                    build_paper(path, cand, qs, store, ocr, **common)
+                    manifest.append({"kind": "section", "path": path, "title": sec, "questions": len(qs)})
+            if "full" in make and multi:
+                path = unique_path(args.out_dir, out_name(cand, cand.exam or "Full paper"), used)
+                build_paper(path, cand, questions, store, ocr, **common)
+                manifest.append({"kind": "full", "path": path, "title": "Full paper", "questions": len(questions)})
+        if "marks" in make:
+            from marks_card import make_marks_card
+            path = os.path.join(args.out_dir, "marks.png")
+            make_marks_card(path, cand, sections, tot, settings=st, show_candidate=not args.hide_candidate,
+                            pos=args.pos, neg=args.neg)
+            manifest.append({"kind": "marks", "path": path, "title": "Marks"})
+        pdf_path = ", ".join(m["path"] for m in manifest)
+    with open(os.path.join(args.out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"outputs": manifest, "total": tot, "sections": sections,
+                   "exam": cand.exam, "date": cand.test_date, "shift": cand.shift}, f, ensure_ascii=False, indent=1)
 
     lines = [f"## {cand.name} · Roll {cand.roll_no}", "",
              f"**Total: {tot['marks']:.2f} / {tot['max']:.0f}** (raw, +{args.pos:g} / −{args.neg:g})", "",
@@ -700,7 +764,7 @@ def main():
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as f:
             f.write(summary + "\n")
-    print(f"\nPDF: {pdf_path}\nCSV: {csv_path}")
+    print(f"\nOUTPUT: {pdf_path}\nCSV: {csv_path}")
 
 
 if __name__ == "__main__":
