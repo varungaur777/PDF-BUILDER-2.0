@@ -11,7 +11,7 @@ Every request is copied to the team's log channel (user name, @username, id, the
 
 ## New in this version
 
-- **Channel join required:** users must join `force_join` (default `@NotesHubX`) first. They get a Join button and a "✅ Maine join kar liya" button; a file sent before joining is kept and processed right after joining (server mode). The bot must be an **admin of that channel** to check members. Team: `/set force_join off` to disable, `/set force_join @OtherChannel` to change.
+- **Channel join required:** users must join every channel in `force_join` (default `@NotesHubX`) first. Several channels: `/set force_join @ChanA, @ChanB`. Private channel: its `-100…` id followed by its invite link, e.g. `/set force_join @ChanA, -1001234567890 https://t.me/+AbCd`. The bot must be an **admin of every one of them**. They get a Join button and a "✅ Maine join kar liya" button; a file sent before joining is kept and processed right after joining (server mode). The bot must be an **admin of that channel** to check members. Team: `/set force_join off` to disable, `/set force_join @OtherChannel` to change.
 - **Queue:** `MAX_PARALLEL` people (default 2) are served at the same time, the rest wait in line and see their number; `/queue` shows it any time. One person can have at most 2 requests waiting.
 - **Links:** users can paste the response sheet link instead of a file. Only SSC exam sites are fetched (`ssc.gov.in`, `ssc.nic.in`, `cbexams.com`, `digialm.com`; change with `ALLOWED_LINK_HOSTS`). Works best from an Indian server.
 - Photos/screenshots are politely refused.
@@ -33,7 +33,7 @@ Every request is copied to the team's log channel (user name, @username, id, the
 | | `/set <name> <value>` | e.g. `/set question_color #1E7D34`, `/set watermark off`, `/set channel_link t.me/NotesHubX` |
 | | `/reset` | back to defaults |
 
-Settings: `force_join`, `channel_name`, `channel_link` (footer + marks photo), `header_title`, `watermark`, `watermark_color`, `watermark_opacity`, `question_color`, `option_color`, `answer_color`, `accent_color`, `font_size`, `language`. They are saved in `settings.json` (committed back to the repo by the bot).
+Settings: `bot_name` (shown in /start), `force_join`, `channel_name`, `channel_link` (footer + marks photo), `header_title`, `watermark`, `watermark_color`, `watermark_opacity`, `question_color`, `option_color`, `answer_color`, `accent_color`, `font_size`, `language`. They are saved in `settings.json` (committed back to the repo by the bot).
 
 **Bilingual papers:** SSC puts an English and a Hindi picture in every cell. The PDF keeps one: `/set language en` (default), `/set language hi` for Hindi, `/set language both` for both. Hindi text pictures are re-wrapped to the column so they are as easy to read as the typed text. A section that only exists in Hindi is always kept.
 
@@ -122,3 +122,11 @@ sudo apt install tesseract-ocr fonts-liberation
 pip install -r requirements.txt
 python ssc_report.py part-a.mhtml part-b.mhtml part-c.mhtml --watermark "@NotesHubX"
 ```
+
+## Switching to a different bot
+
+1. @BotFather → new bot → copy its token.
+2. GitHub repo → Settings → Secrets → Actions → edit `TELEGRAM_BOT_TOKEN` (and `LOG_CHAT_ID` for a new log channel).
+3. Vercel → ssc-bot-hook → Settings → Environment Variables → edit `TELEGRAM_BOT_TOKEN` → Deployments → Redeploy.
+4. Open `https://ssc-bot-hook.vercel.app/api/telegram` once (shows ✅).
+5. Make the new bot an admin of the log channel and of every `force_join` channel. `/set bot_name ...` for the name in /start.

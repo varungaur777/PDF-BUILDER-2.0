@@ -16,7 +16,8 @@ Environment
   LOG_CHAT_ID          channel/group that gets a copy of every request          (optional)
   PUBLIC_BOT           true (default) = anyone can use the bot in a private chat
   MAX_PARALLEL         how many people are served at the same time (default 2); the rest wait in a queue
-  (users must join the channel in settings "force_join" first; /set force_join off to disable)
+  (users must join the channel(s) in settings "force_join" first, e.g. /set force_join @ChanA, @ChanB;
+   /set force_join off to disable)
 
 What users can send (DM)
   - the saved response sheet page(s): .mhtml / .txt / .html, any name, 1 or all parts
@@ -28,9 +29,7 @@ What users can send (DM)
 Admins: /settings, /set <key> <value>, /reset
 """
 
-import html
 import json
-import queue
 import threading
 import mimetypes
 import os
@@ -64,24 +63,29 @@ UPDATES = ["message", "channel_post", "callback_query"]
 MODES = ("sections", "full", "marks", "report", "all")
 
 HELP = (
-    "👋 SSC Answer Key Bot\n\n"
-    "Apni SSC response sheet bhejo, bot wapas dega:\n"
-    "📄 har section ki alag PDF (Question → options → official answer)\n"
-    "📘 full paper ki ek PDF\n"
-    "📊 marks calculation ki photo\n\n"
-    "Do tareeke:\n"
-    "1️⃣ Response sheet ka link yahan paste karo, ya\n"
-    "2️⃣ Chrome mein response sheet kholo → ⋮ → ↓ (download) → jo file bani woh yahan bhejo.\n"
-    "Saare parts ek saath bhej sakte ho.\n\n"
-    "Sirf ek cheez chahiye? Caption/message mein likho:\n"
-    "/marks – sirf marks photo\n"
-    "/full – sirf full paper\n"
-    "/sections – sirf section-wise PDFs\n"
-    "/report – galat answers ke saath analysis\n"
-    "'yours' likhoge to aapka answer bhi dikhega.\n\n"
-    "/queue – line mein aapka number\n\n"
-    "ℹ️ Aapki bheji file/link aur bot ka jawab team ke record ke liye save hota hai."
+    "👋 {bot_name}\n\n"
+    "Send your SSC response sheet and get back:\n"
+    "📄 a separate PDF for every section (question → options → official answer)\n"
+    "📘 the full paper as one PDF\n"
+    "📊 your marks calculation as a photo\n\n"
+    "How to send it:\n"
+    "1️⃣ Open your response sheet in Chrome → ⋮ → ↓ (Download) → send the saved file here.\n"
+    "2️⃣ Or paste the response sheet link here (works only when the SSC site allows it — the file always works).\n"
+    "You can send all parts together.\n\n"
+    "Need only one thing? Write it in the caption or as a message:\n"
+    "/marks – marks photo only\n"
+    "/full – full paper only\n"
+    "/sections – section-wise PDFs only\n"
+    "/report – analysis with your wrong answers\n"
+    "Add the word 'yours' to also see your own answers.\n\n"
+    "/queue – your place in line\n\n"
+    "ℹ️ The files/links you send and the bot's replies are saved for our records."
 )
+
+
+def help_text():
+    import settings as S
+    return HELP.replace("{bot_name}", S.load().get("bot_name") or "SSC Answer Key Bot")
 
 
 # --------------------------------------------------------------------------
@@ -347,7 +351,7 @@ def allowed_chat(m, chat_id, chat_type):
 def settings_command(chat_id, text, m):
     import settings as S
     if not is_admin(m, chat_id):
-        send_message(chat_id, "🔒 Yeh command sirf team ke liye hai.", m.get("message_id"))
+        send_message(chat_id, "🔒 This command is for the team only.", m.get("message_id"))
         return
     st = S.load()
     cmd = text.split(None, 1)[0].lower().split("@")[0]
@@ -362,7 +366,7 @@ def settings_command(chat_id, text, m):
         return
     parts = text.split(None, 2)
     if len(parts) < 3:
-        send_message(chat_id, "Use: /set <name> <value>\ne.g. /set channel_link t.me/NotesHubX\nSend /settings for all names.",
+        send_message(chat_id, "Use: /set <name> <value>\ne.g. /set channel_link t.me/YourChannel\nSend /settings for all names.",
                      m.get("message_id"))
         return
     key, raw = parts[1], parts[2]
@@ -386,15 +390,15 @@ def build(chat_id, job, workdir):
     local = []
     for i, (file_id, name, size) in enumerate(files[:MAX_FILES]):
         if size and size > MAX_DOWNLOAD:
-            send_message(chat_id, f"⚠️ {name} 20 MB se badi hai, Telegram bot use download nahi karne deta. "
-                                  "Har part alag file mein bhejo.", reply_to)
+            send_message(chat_id, f"⚠️ {name} is bigger than 20 MB — Telegram doesn't let bots download it. "
+                                  "Send each part as a separate file.", reply_to)
             continue
         # the file type is detected from its content, so the name doesn't matter (.mhtml → .txt etc.)
         dest = os.path.join(workdir, f"part{i + 1}.txt")
         download(file_id, dest)
         local.append(dest)
     if len(files) > MAX_FILES:
-        send_message(chat_id, f"⚠️ Ek baar mein {MAX_FILES} files tak. Pehli {MAX_FILES} le li hain.", reply_to)
+        send_message(chat_id, f"⚠️ Up to {MAX_FILES} files at a time. I took the first {MAX_FILES}.", reply_to)
     if not local and not links:
         return
 
@@ -429,7 +433,7 @@ def build(chat_id, job, workdir):
         err = (p.stderr or p.stdout or "").strip().splitlines()
         msg = "\n".join(err[-6:]) or "unknown error"
         msg = re.sub(r"part\d+\.txt: ", "", msg)
-        send_message(chat_id, f"❌ PDF nahi ban payi.\n\n{msg}\n\nChrome mein ⋮ → ↓ se save ki hui file bhejo.", reply_to)
+        send_message(chat_id, f"❌ Couldn't make the PDF.\n\n{msg}\n\nSend the page saved from Chrome (⋮ → ↓ Download).", reply_to)
         log_safe(api, "sendMessage", {"chat_id": LOG_CHAT, "text": f"❌ Failed for {job['who']}\n{msg[:500]}"})
         return
 
@@ -442,9 +446,8 @@ def build(chat_id, job, workdir):
     ch = st.get("channel_name") or ""
     link = (st.get("channel_link") or "").replace("https://", "")
     join = f"\n\n📢 {ch} · {link}" if (ch or link) else ""
-    ocr = re.search(r"kept as pictures( \(\d+ Hindi\))?", p.stdout)
     pics = re.search(r"(\d+) kept as pictures", p.stdout)
-    note = "\n🖼 Figure/Hindi wale question original photo mein hain." if pics and pics.group(1) != "0" else ""
+    note = "\n🖼 Figure/Hindi questions are shown as the original picture." if pics and pics.group(1) != "0" else ""
 
     docs = [o["path"] for o in outs if o["kind"] in ("section", "full", "report")]
     photo = next((o["path"] for o in outs if o["kind"] == "marks"), None)
@@ -463,7 +466,7 @@ def build(chat_id, job, workdir):
         os.path.join(workdir, "summary.md")) else ""
     if "**Problems:**" in probs:
         probs = re.sub(r"part(\d+)\.txt", r"file \1", probs.split("**Problems:**", 1)[1].strip())
-        send_message(chat_id, "⚠️ Kuch files chhod di gayi:\n" + probs[:1500], reply_to)
+        send_message(chat_id, "⚠️ Some files were skipped:\n" + probs[:1500], reply_to)
     print(f"sent {len(docs)} file(s){' + marks photo' if photo else ''}")
 
 
@@ -481,55 +484,70 @@ def _is_input(m):
 # --------------------------------------------------------------------------
 
 _member_cache = {}
-_gate_warned = [False]
+_gate_warned = set()
+
+
+def join_channels():
+    """[(chat id for the API, join link)] from settings force_join (several channels allowed)."""
+    import settings as S
+    return S.join_channels(S.load().get("force_join") or "")
 
 
 def join_channel():
-    import settings as S
-    return (S.load().get("force_join") or "").strip()
+    return ", ".join(ref for ref, _ in join_channels())
 
 
-def join_link(ch):
-    return f"https://t.me/{ch.lstrip('@')}" if ch.startswith("@") else ""
-
-
-def is_member(user_id):
-    """True if the user has joined the force_join channel (or no channel is set)."""
-    ch = join_channel()
-    if not ch or str(user_id) in ADMINS:
-        return True
+def _joined(user_id, ref):
     now = time.time()
-    hit = _member_cache.get(user_id)
+    hit = _member_cache.get((user_id, ref))
     if hit and now < hit[1]:
         return hit[0]
     try:
-        r = api("getChatMember", {"chat_id": ch, "user_id": user_id})
+        r = api("getChatMember", {"chat_id": ref, "user_id": user_id})
         ok = r.get("status") in ("creator", "administrator", "member") or \
             (r.get("status") == "restricted" and r.get("is_member"))
     except Exception as e:
-        # bot isn't admin in the channel or the channel is wrong: don't lock everyone out
-        if not _gate_warned[0]:
-            _gate_warned[0] = True
-            print(f"join check failed ({e}); letting users through", file=sys.stderr)
+        # bot isn't admin in that channel or the channel is wrong: don't lock everyone out
+        if ref not in _gate_warned:
+            _gate_warned.add(ref)
+            print(f"join check failed for {ref} ({e}); letting users through", file=sys.stderr)
             log_safe(api, "sendMessage", {"chat_id": LOG_CHAT, "text":
-                     f"⚠️ Channel join check isn't working for {ch}: {e}\n"
-                     "Make the bot an admin of that channel, or /set force_join off."})
+                     f"⚠️ Channel join check isn't working for {ref}: {e}\n"
+                     "Make the bot an admin of that channel, or fix it with /set force_join."})
         return True
-    _member_cache[user_id] = (ok, now + (600 if ok else 15))
+    _member_cache[(user_id, ref)] = (ok, now + (600 if ok else 15))
     return ok
 
 
-def join_prompt(chat_id, reply_to=None, held=False):
-    ch = join_channel()
-    import settings as S
-    name = S.load().get("channel_name") or ch
-    text = (f"🔒 Bot use karne ke liye pehle hamara channel join karo: {ch}\n\n"
-            "Join karke neeche ✅ button dabao."
-            + ("\n\n📎 Aapki file sambhal kar rakhi hai — join karte hi PDF banni shuru ho jayegi." if held else ""))
+def missing_channels(user_id):
+    """Channels from force_join the user hasn't joined yet (empty = OK to use the bot)."""
+    if str(user_id) in ADMINS:
+        return []
+    return [(ref, link) for ref, link in join_channels() if not _joined(user_id, ref)]
+
+
+def is_member(user_id):
+    return not missing_channels(user_id)
+
+
+def forget_membership(user_id):
+    for k in [k for k in _member_cache if k[0] == user_id]:
+        _member_cache.pop(k, None)
+
+
+def join_prompt(chat_id, reply_to=None, held=False, user_id=None):
+    chans = (missing_channels(user_id) if user_id else None) or join_channels()
+    many = len(chans) > 1
+    names = "\n".join(f"• {ref if ref.startswith('@') else 'our private channel'}" for ref, _ in chans)
+    text = (f"🔒 To use this bot, please join our channel{'s' if many else ''} first:\n{names}\n\n"
+            f"After joining{' all of them' if many else ''}, tap ✅ below."
+            + ("\n\n📎 Your file is saved — it will be processed as soon as you join." if held else ""))
     buttons = []
-    if join_link(ch):
-        buttons.append([{"text": f"📢 Join {name}", "url": join_link(ch)}])
-    buttons.append([{"text": "✅ Maine join kar liya", "callback_data": "joined"}])
+    for n, (ref, link) in enumerate(chans, 1):
+        if link:
+            label = f"📢 Join {ref}" if ref.startswith("@") else f"📢 Join channel {n}"
+            buttons.append([{"text": label, "url": link}])
+    buttons.append([{"text": "✅ I've joined", "callback_data": "joined"}])
     send_message(chat_id, text, reply_to, buttons)
 
 
@@ -585,12 +603,12 @@ class Dispatcher:
             job["had_to_wait"] = ahead >= 0
             self.cv.notify()
         n = len(job["files"]) + len(job["links"])
-        what = f"{n} file" if job["files"] else f"{n} link"
+        what = ("file" if job["files"] else "link") + ("s" if n > 1 else "")
         if job["had_to_wait"]:
-            send_message(job["chat_id"], f"🕐 {what} mil gayi. Abhi bheed hai — queue mein aapka number: {ahead + 1}.\n"
-                                         "Baari aate hi PDF banni shuru hogi. /queue se number dekh sakte ho.", job["reply_to"])
+            send_message(job["chat_id"], f"🕐 Got your {what}. It's busy right now — your place in line: {ahead + 1}.\n"
+                                         "Your PDF will start when it's your turn. Check anytime with /queue.", job["reply_to"])
         else:
-            send_message(job["chat_id"], f"⏳ {what} mil gayi. PDF ban rahi hai… (lagbhag 1 minute har part)", job["reply_to"])
+            send_message(job["chat_id"], f"⏳ Got your {what}. Making your PDF… (about 1 minute per part)", job["reply_to"])
 
     def promote(self, force=False):
         """Move people who stopped sending files into the queue."""
@@ -604,8 +622,8 @@ class Dispatcher:
             if j["files"] or j["links"]:
                 self.enqueue(j)
             elif j["modes"]:
-                send_message(j["chat_id"], "📎 Ab apni response sheet ki file ya link bhejo "
-                                           "(command caption mein bhi likh sakte ho).", j["reply_to"])
+                send_message(j["chat_id"], "📎 Now send your response sheet file or link "
+                                           "(you can also write the command in the caption).", j["reply_to"])
 
     # ---- workers
     def start(self):
@@ -631,12 +649,12 @@ class Dispatcher:
                 return
             try:
                 if job.get("had_to_wait"):
-                    send_message(job["chat_id"], "🚀 Aapki baari aa gayi! PDF ban rahi hai…", job["reply_to"])
+                    send_message(job["chat_id"], "🚀 It's your turn! Making your PDF…", job["reply_to"])
                 log_request(job)
                 with tempfile.TemporaryDirectory() as wd:
                     build(job["chat_id"], job, wd)
             except Exception as e:
-                send_message(job["chat_id"], f"❌ Kuch gadbad ho gayi: {e}", job["reply_to"])
+                send_message(job["chat_id"], f"❌ Something went wrong: {e}", job["reply_to"])
                 log_safe(api, "sendMessage", {"chat_id": LOG_CHAT, "text": f"❌ Error for {job['who']}: {e}"[:1000]})
                 print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
             finally:
@@ -667,21 +685,21 @@ class Dispatcher:
 
         if first in ("/start", "/help", "/id"):
             extra = f"\n\n🆔 Chat id: {chat_id}" + (f" · your id: {uid}" if uid else "")
-            send_message(chat_id, HELP + extra, m.get("message_id"))
+            send_message(chat_id, help_text() + extra, m.get("message_id"))
             if gate and not is_member(uid):
-                join_prompt(chat_id)
+                join_prompt(chat_id, user_id=uid)
             return
         if first in ("/set", "/settings", "/reset"):
             return settings_command(chat_id, text, m)
         if first == "/queue":
             pos = self.position(chat_id)
-            msg = ("🚀 Aapki PDF abhi ban rahi hai." if pos == 0 else
-                   f"🕐 Queue mein aapka number: {pos}." if pos else
-                   "✅ Aap queue mein nahi ho. File ya link bhejo.")
+            msg = ("🚀 Your PDF is being made right now." if pos == 0 else
+                   f"🕐 Your place in line: {pos}." if pos else
+                   "✅ You're not in the queue. Send a file or link.")
             return send_message(chat_id, msg, m.get("message_id"))
         if not allowed_chat(m, chat_id, chat_type):
             if chat_type == "private":
-                send_message(chat_id, "🔒 Yeh bot abhi private hai.", m.get("message_id"))
+                send_message(chat_id, "🔒 This bot is private right now.", m.get("message_id"))
             return
 
         # links: only SSC exam sites
@@ -690,8 +708,8 @@ class Dispatcher:
             url = url.rstrip(").,>]'\"")
             (links if self._link_ok(url) else bad).append(url)
         if bad and not links and not m.get("document"):
-            send_message(chat_id, "❌ Yeh SSC response sheet ka link nahi lagta. "
-                                  "ssc.gov.in / cbexams.com wala link bhejo, ya saved page file.", m.get("message_id"))
+            send_message(chat_id, "❌ That doesn't look like an SSC response sheet link. "
+                                  "Send the link from ssc.gov.in / cbexams.com, or the saved page file.", m.get("message_id"))
 
         doc = m.get("document")
         file_ok = False
@@ -702,17 +720,17 @@ class Dispatcher:
             file_ok = (ext in FILE_EXT or ext == "" or "mhtml" in mime or "multipart" in mime
                        or mime in ("text/plain", "text/html", "application/octet-stream", "message/rfc822"))
             if not file_ok:
-                send_message(chat_id, f"❌ {name} nahi padh sakta. Response sheet ka link bhejo, "
-                                      "ya Chrome mein ⋮ → ↓ se save ki hui page file.", m.get("message_id"))
+                send_message(chat_id, f"❌ Can't read {name}. Send the response sheet link, "
+                                      "or the page saved from Chrome (⋮ → ↓ Download).", m.get("message_id"))
         if m.get("photo"):
-            send_message(chat_id, "📷 Photo/screenshot se nahi ban sakta. Response sheet ka link bhejo, "
-                                  "ya Chrome mein ⋮ → ↓ se save ki hui page file.", m.get("message_id"))
+            send_message(chat_id, "📷 Photos/screenshots can't be used. Send the response sheet link, "
+                                  "or the page saved from Chrome (⋮ → ↓ Download).", m.get("message_id"))
 
         modes = parse_modes(text)
         if not (file_ok or links or modes):
             return
         if self.queued_count(chat_id) >= MAX_QUEUED_PER_USER and (file_ok or links):
-            return send_message(chat_id, "✋ Aapki pichhli request abhi line mein hai. Woh poori hone do.", m.get("message_id"))
+            return send_message(chat_id, "✋ Your previous request is still in line. Please wait for it to finish.", m.get("message_id"))
 
         member = (not gate) or not (file_ok or links) or is_member(uid)
         with self.lock:
@@ -740,13 +758,13 @@ class Dispatcher:
                 self.held[chat_id] = job
             if first_hold:
                 if self.persistent:
-                    join_prompt(chat_id, m.get("message_id"), held=True)
+                    join_prompt(chat_id, m.get("message_id"), held=True, user_id=uid)
                 else:
-                    join_prompt(chat_id, m.get("message_id"))
-                    send_message(chat_id, "Join karne ke baad file/link dobara bhejna.")
+                    join_prompt(chat_id, m.get("message_id"), user_id=uid)
+                    send_message(chat_id, "After joining, please send the file/link again.")
             return
         if (file_ok or links) and len(job["files"]) + len(job["links"]) == 1 and self.persistent:
-            send_message(chat_id, f"📥 Mil gaya. Baaki parts ho to bhej do — {QUIET_SECONDS} sec baad shuru karunga.",
+            send_message(chat_id, f"📥 Got it. Send any other parts now — I'll start in {QUIET_SECONDS} seconds.",
                          m.get("message_id"))
 
     def _link_ok(self, url):
@@ -762,11 +780,12 @@ class Dispatcher:
         chat_id = str((msg.get("chat") or {}).get("id", uid))
         if cq.get("data") != "joined":
             return log_safe_ok(api, "answerCallbackQuery", {"callback_query_id": cq["id"]})
-        _member_cache.pop(uid, None)
-        if is_member(uid):
+        forget_membership(uid)
+        missing = missing_channels(uid)
+        if not missing:
             log_safe_ok(api, "answerCallbackQuery", {"callback_query_id": cq["id"], "text": "✅ Welcome!"})
             log_safe_ok(api, "editMessageText", {"chat_id": chat_id, "message_id": msg.get("message_id"),
-                                                 "text": "✅ Channel join ho gaya. Shukriya!"})
+                                                 "text": "✅ Joined. Thank you!"})
             with self.lock:
                 job = self.held.pop(chat_id, None)
             if job and (job["files"] or job["links"]):
@@ -775,10 +794,12 @@ class Dispatcher:
                     self.pending[chat_id] = job
                 self.promote()
             else:
-                send_message(chat_id, "Ab apni response sheet ka link ya file bhejo 📎")
+                send_message(chat_id, "Now send your response sheet file or link 📎")
         else:
             log_safe_ok(api, "answerCallbackQuery", {"callback_query_id": cq["id"], "show_alert": "true",
-                                                     "text": "❌ Abhi join nahi dikh raha. Pehle channel join karo, phir dobara dabao."})
+                                                     "text": "❌ Not joined yet: "
+                                                     + ", ".join(r if r.startswith("@") else "private channel" for r, _ in missing)
+                                                     + ". Join, then tap again."})
 
 
 def log_safe_ok(fn, *a, **kw):

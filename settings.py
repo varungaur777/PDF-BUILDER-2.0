@@ -19,7 +19,9 @@ PATH = os.environ.get("SETTINGS_FILE", os.path.join(HERE, "settings.json"))
 
 # key: (default, kind, help)
 SCHEMA = {
-    "force_join":        ("@NotesHubX", "channel", "users must join this channel before using the bot (off = anyone)"),
+    "bot_name":          ("SSC Answer Key Bot", "text", "bot name shown in /start"),
+    "force_join":        ("@NotesHubX", "channels", "channels users must join first, comma separated (off = anyone). "
+                          "Private channel: -100id followed by its invite link"),
     "channel_name":      ("NotesHubX", "text", "channel name in the footer and on the marks photo"),
     "channel_link":      ("https://t.me/NotesHubX", "url", "channel link in the footer (clickable)"),
     "header_title":      ("Staff Selection Commission", "text", "big title in the PDF header"),
@@ -60,6 +62,33 @@ def load():
     return s
 
 
+def _one_channel(item):
+    """'@name' / 't.me/name' / '-100123 https://t.me/+invite' -> normalised text, or an error."""
+    m = re.fullmatch(r"(?:https?://)?(?:t\.me/|telegram\.me/)?@?([A-Za-z][A-Za-z0-9_]{3,31})/?", item)
+    if m:
+        return "@" + m.group(1), None
+    m = re.fullmatch(r"(-100\d{6,})(?:\s+((?:https?://)?t\.me/\S+))?", item)
+    if m:
+        link = m.group(2) or ""
+        if link and not link.startswith("http"):
+            link = "https://" + link
+        return (m.group(1) + (" " + link if link else "")), None
+    return None, (f"'{item}' is not a channel. Use @username (e.g. @NotesHubX), its t.me link, or for a private "
+                  "channel its -100… id followed by the invite link. Separate several channels with commas. "
+                  "off = no join check.")
+
+
+def join_channels(value):
+    """force_join text -> [(chat_id_for_api, join_link)]"""
+    out = []
+    for item in [x.strip() for x in (value or "").split(",") if x.strip()]:
+        parts = item.split()
+        ref = parts[0]
+        link = parts[1] if len(parts) > 1 else (f"https://t.me/{ref.lstrip('@')}" if ref.startswith("@") else "")
+        out.append((ref, link))
+    return out
+
+
 def validate(key, raw):
     """Return (value, error)."""
     key = key.strip().lower()
@@ -87,15 +116,18 @@ def validate(key, raw):
         if v in opts:
             return v, None
         return None, f"{key} must be one of: {', '.join(opts)}."
-    if kind == "channel":
+    if kind == "channels":
         if raw.lower() in ("off", "none", "-"):
             return "", None
-        m = re.fullmatch(r"(?:https?://)?(?:t\.me/|telegram\.me/)?@?([A-Za-z][A-Za-z0-9_]{3,31})/?", raw)
-        if m:
-            return "@" + m.group(1), None
-        if re.fullmatch(r"-100\d{6,}", raw):
-            return raw, None
-        return None, "Use the channel @username (e.g. @NotesHubX), its t.me link, or its -100… id. off = no join check."
+        out = []
+        for item in [x.strip() for x in re.split(r"[,\n]+", raw) if x.strip()]:
+            v, err = _one_channel(item)
+            if err:
+                return None, err
+            out.append(v)
+        if len(out) > 5:
+            return None, "At most 5 channels."
+        return ", ".join(out), None
     if kind == "url":
         if raw.lower() in ("off", "none", "-"):
             return "", None
