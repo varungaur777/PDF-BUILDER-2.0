@@ -177,7 +177,23 @@ def reflow(blob, max_w_pt, band_pt=11.0, scale=None, lo_pt=None, hi_pt=None, thr
         Image.fromarray(a).save(buf, "PNG")
         return buf.getvalue(), W * scale, H * scale
 
+    # gap between words: split the empty-column gaps of all lines into "inside a word" and
+    # "between words" (Otsu), so letters of one word never get pulled apart
+    gaps = []
+    for s0, e0 in lines:
+        segs = _runs(ink[s0:e0].any(axis=0), 1)
+        gaps += [b[0] - a[1] for a, b in zip(segs, segs[1:])]
     word_gap = max(2, int(0.26 * med))
+    if len(gaps) >= 6:
+        g = np.array(sorted(gaps), dtype=float)
+        best, cut = -1.0, None
+        for t in np.unique(g)[:-1]:
+            lo, hi = g[g <= t], g[g > t]
+            v = len(lo) * len(hi) * (lo.mean() - hi.mean()) ** 2
+            if v > best:
+                best, cut = v, t + 1
+        if cut is not None:
+            word_gap = int(min(max(cut, 0.15 * med, 2), 0.6 * med))
     space = int(0.35 * med)
     right = max(int(np.where(ink[s:e].any(axis=0))[0][-1]) for s, e in lines)
 
@@ -193,12 +209,10 @@ def reflow(blob, max_w_pt, band_pt=11.0, scale=None, lo_pt=None, hi_pt=None, thr
         anchor = int(np.argmax(top_part))
         para = prev_end is not None and (s - prev_end) > 1.1 * med
         src.append(dict(s=s, e=e, anchor=anchor, words=words, para=para,
-                        full=bool(words) and words[-1][1] >= 0.85 * right))
+                        full=bool(words) and words[-1][1] >= 0.88 * right))
         prev_end = e
-    # a line only "runs on" into the next one when the picture clearly holds a wrapped paragraph
-    if sum(L["full"] for L in src) < 2:
-        for L in src:
-            L["full"] = False
+    if len(src) == 1:
+        src[0]["full"] = False
 
     def gap_between(p, q):
         """keep the original spacing between pieces of the same line (a false split stays invisible)"""
@@ -243,6 +257,8 @@ def reflow(blob, max_w_pt, band_pt=11.0, scale=None, lo_pt=None, hi_pt=None, thr
         placed.append((total_h, items))
         total_h += up + down + lead
     total_h -= lead
+    if out_w > avail * 1.02:
+        return None                 # a single piece wider than the column: keep the picture
     canvas = Image.new("L", (max(1, out_w), max(1, total_h)), 255)
     for top, items in placed:
         for x, dy, L, wx0, wx1 in items:
@@ -254,3 +270,54 @@ def reflow(blob, max_w_pt, band_pt=11.0, scale=None, lo_pt=None, hi_pt=None, thr
     buf = io.BytesIO()
     canvas.save(buf, "PNG")
     return buf.getvalue(), out_w * scale, total_h * scale
+
+
+def split_question(blob, thr=160):
+    """
+    SSC figure questions are one wide picture: a few lines of text on top, the figures below.
+    Returns (text_png, figure_png, text_line_px) or None when the picture isn't built that way.
+    The text is only taken from the top, before the first tall (figure) row, so labels under
+    figures stay with their figures.
+    """
+    a = _gray(blob)
+    if a is None:
+        return None
+    b = _bbox(a, thr)
+    if b is None:
+        return None
+    y0, y1, x0, x1 = b
+    a = a[y0:y1, x0:x1]
+    ink = a < thr
+    runs = _runs(ink.sum(axis=1) > 0, 1)
+    if len(runs) < 2:
+        return None
+    hs = [e - s for s, e in runs]
+    small = sorted(h for h in hs if h >= 5)
+    if not small:
+        return None
+    base = small[0]
+    text_h = sorted(h for h in small if h <= 1.8 * base)
+    text_h = text_h[len(text_h) // 2]
+    first_fig = next((i for i, h in enumerate(hs) if h > 2.4 * text_h), None)
+    if not first_fig:                       # no figure, or the picture starts with one
+        return None
+    top_end = runs[first_fig - 1][1]
+    fig_start = runs[first_fig][0]
+    if fig_start - top_end < 2:
+        return None
+
+    def png(arr):
+        bb = _bbox(arr, thr)
+        if bb is None:
+            return None
+        ya, yb, xa, xb = bb
+        pad = 3
+        crop = arr[max(0, ya - pad):yb + pad, max(0, xa - pad):xb + pad]
+        buf = io.BytesIO()
+        Image.fromarray(crop).save(buf, "PNG")
+        return buf.getvalue()
+
+    text_png, fig_png = png(a[:top_end]), png(a[fig_start:])
+    if not text_png or not fig_png:
+        return None
+    return text_png, fig_png, text_h

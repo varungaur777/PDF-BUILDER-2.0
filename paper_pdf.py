@@ -9,7 +9,7 @@ import re
 
 from PIL import Image as PILImage
 
-from img_tools import line_height, reflow, trim
+from img_tools import line_height, reflow, split_question, trim
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -134,7 +134,7 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
             _scales[reason] = band / hs[len(hs) // 2] if hs else None
         return _scales[reason]
 
-    def img_flow(key, max_w, max_h=110 * mm):
+    def img_flow(key, max_w, max_h=110 * mm, match=None):
         blob = store.get(key)
         if not blob:
             return None
@@ -152,9 +152,41 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
         blob = _trimmed[key]
         w, h = PILImage.open(io.BytesIO(blob)).size
         scale = min(0.62, max_w / w)
+        if match:
+            # option pictures next to a question figure: meet it halfway so both look alike in size
+            scale = min(max_w / w, (scale * match) ** 0.5)
         if h * scale > max_h:
             scale = max_h / h
         return Image(io.BytesIO(blob), width=w * scale, height=h * scale, hAlign="LEFT")
+
+    fig_scale = [None]            # pt per pixel of the current question's figure
+
+    def question_picture(key):
+        """Flowables for a question picture that isn't typed text. A wide 'text on top, figures
+        below' picture is split: the text is re-wrapped to the column at text size and the figures
+        get the full column width."""
+        blob = store.get(key)
+        r = ocr.get(key)
+        if not blob or (r is not None and r.reason == "hindi"):
+            im = img_flow(key, col_w)
+            return [Spacer(1, 2), im] if im else []
+        parts = split_question(blob)
+        if parts:
+            text_png, fig_png, text_h = parts
+            got = reflow(text_png, col_w, scale=FS * 1.08 / max(1, text_h))
+            fw, fh = PILImage.open(io.BytesIO(fig_png)).size
+            fs = min(0.8, col_w / fw)
+            if fh * fs > 95 * mm:
+                fs = 95 * mm / fh
+            if got:
+                data, w, h = got
+                fig_scale[0] = fs
+                return [Spacer(1, 2), Image(io.BytesIO(data), width=w, height=h, hAlign="LEFT"), Spacer(1, 4),
+                        Image(io.BytesIO(fig_png), width=fw * fs, height=fh * fs, hAlign="LEFT")]
+        im = img_flow(key, col_w)
+        if im:
+            fig_scale[0] = im.drawWidth / max(1, PILImage.open(io.BytesIO(_trimmed.get(key) or blob)).size[0])
+        return [Spacer(1, 2), im] if im else []
 
     def _pic_size(k):
         try:
@@ -306,13 +338,13 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
         ]))
         return t
 
-    def cell_flows(parts, style, max_w, max_h):
+    def cell_flows(parts, style, max_w, max_h, match=None):
         out = []
         for txt, key in parts:
             if txt is not None:
                 out.append(Paragraph(txt, style))
             else:
-                im = img_flow(key, max_w, max_h)
+                im = img_flow(key, max_w, max_h, match)
                 if im:
                     out.append(im)
         return out or [Paragraph("", style)]
@@ -342,7 +374,7 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
         # all options are small pictures (figures): 2 x 2 grid saves a lot of space
         half = col_w / 2
         if len(items) in (2, 4) and all(p and all(t is None for t, _ in p) for _, p in items):
-            flows = [(lab, cell_flows(p, OPT, half - 10 * mm, 38 * mm)) for lab, p in items]
+            flows = [(lab, cell_flows(p, OPT, half - 10 * mm, 38 * mm, fig_scale[0])) for lab, p in items]
             if all(getattr(f, "drawWidth", 0) <= half - 9 * mm for _, fl in flows for f in fl):
                 rows = []
                 for i in range(0, len(flows), 2):
@@ -358,7 +390,7 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
         rows = []
         for lab, p in items:
             rows.append([Paragraph(f"<font name='{FONT_B}'>({lab})</font>", OPT),
-                         cell_flows(p, OPT, col_w - 9 * mm, 45 * mm)])
+                         cell_flows(p, OPT, col_w - 9 * mm, 45 * mm, fig_scale[0])])
         t = Table(rows, colWidths=[8 * mm, col_w - 8 * mm], hAlign="LEFT")
         t.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                                ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5)]))
@@ -395,6 +427,7 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
         last_passage = None
         for q in qs:
             label = f"<font name='{FONT_B}'>Q.{q.qno}.</font> "
+            fig_scale[0] = None
             parts = parts_of(q.q_imgs or ([q.q_img] if q.q_img else []), q.q_text)
             block = []
             first_txt = parts[0][0] if parts else None
@@ -421,9 +454,7 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
                 if txt is not None:
                     block.append(Paragraph(txt, Q))
                 else:
-                    im = img_flow(key, col_w)
-                    if im:
-                        block += [Spacer(1, 2), im]
+                    block += question_picture(key)
             block.append(Spacer(1, 3))
             block += options_block(q)
             block.append(Spacer(1, 4))
