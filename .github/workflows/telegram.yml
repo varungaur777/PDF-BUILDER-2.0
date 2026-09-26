@@ -5,7 +5,7 @@ on:
     inputs:
       hook_url:
         description: "Vercel webhook to reconnect after the run (filled in automatically)"
-        required: true
+        required: false
         default: ""
   schedule:
     - cron: "17 * * * *"
@@ -15,7 +15,7 @@ permissions:
 
 concurrency:
   group: telegram-bot
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   poll:
@@ -25,8 +25,9 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       LOG_CHAT_ID: ${{ secrets.LOG_CHAT_ID }}
-      PUBLIC_BOT: "false"
+      PUBLIC_BOT: "true"
       QUIET_SECONDS: "45"
+      MAX_PARALLEL: "2"
     steps:
       - uses: actions/checkout@v4
 
