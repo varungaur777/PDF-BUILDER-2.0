@@ -15,6 +15,8 @@ Environment
                        channels (ADMIN_IDS works too)
   LOG_CHAT_ID          channel/group that gets a copy of every request          (optional)
   PUBLIC_BOT           true (default) = anyone can use the bot in a private chat
+  MAX_PARALLEL         how many people are served at the same time (default 2); the rest wait in a queue
+  (users must join the channel in settings "force_join" first; /set force_join off to disable)
 
 What users can send (DM)
   - the saved response sheet page(s): .mhtml / .txt / .html, any name, 1 or all parts
@@ -28,6 +30,8 @@ Admins: /settings, /set <key> <value>, /reset
 
 import html
 import json
+import queue
+import threading
 import mimetypes
 import os
 import re
@@ -53,24 +57,30 @@ MAX_FILES = 8                         # per person per request
 QUIET_SECONDS = int(os.environ.get("QUIET_SECONDS", "120"))   # wait after the last file so all parts go together
 MAX_WAIT = 600
 RUN_BUDGET = int(os.environ.get("RUN_BUDGET_SECONDS", str(45 * 60)))  # keep taking new requests for this long
+MAX_PARALLEL = max(1, int(os.environ.get("MAX_PARALLEL", "2")))
+MAX_QUEUED_PER_USER = 2
+UPDATES = ["message", "channel_post", "callback_query"]
 
 MODES = ("sections", "full", "marks", "report", "all")
 
 HELP = (
     "👋 SSC Answer Key Bot\n\n"
-    "Apni SSC response sheet ka page bhejo, bot wapas dega:\n"
+    "Apni SSC response sheet bhejo, bot wapas dega:\n"
     "📄 har section ki alag PDF (Question → options → official answer)\n"
     "📘 full paper ki ek PDF\n"
     "📊 marks calculation ki photo\n\n"
-    "Kaise: Chrome mein response sheet kholo → ⋮ → ↓ (download). Jo file bani (.mhtml) woh yahan bhej do. "
-    "Saare parts ek saath bhej sakte ho. Naam kuch bhi ho, chalega.\n\n"
-    "Sirf ek cheez chahiye? File ke caption mein likho:\n"
+    "Do tareeke:\n"
+    "1️⃣ Response sheet ka link yahan paste karo, ya\n"
+    "2️⃣ Chrome mein response sheet kholo → ⋮ → ↓ (download) → jo file bani woh yahan bhejo.\n"
+    "Saare parts ek saath bhej sakte ho.\n\n"
+    "Sirf ek cheez chahiye? Caption/message mein likho:\n"
     "/marks – sirf marks photo\n"
     "/full – sirf full paper\n"
     "/sections – sirf section-wise PDFs\n"
     "/report – galat answers ke saath analysis\n"
-    "Caption mein 'yours' likhoge to aapka answer bhi dikhega.\n\n"
-    "ℹ️ Aapki bheji file aur bot ka jawab team ke record ke liye save hota hai."
+    "'yours' likhoge to aapka answer bhi dikhega.\n\n"
+    "/queue – line mein aapka number\n\n"
+    "ℹ️ Aapki bheji file/link aur bot ka jawab team ke record ke liye save hota hai."
 )
 
 
@@ -136,10 +146,12 @@ def _reply(fields, reply_to):
     return fields
 
 
-def send_message(chat_id, text, reply_to=None):
+def send_message(chat_id, text, reply_to=None, buttons=None):
+    p = {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": "true"}
+    if buttons:
+        p["reply_markup"] = {"inline_keyboard": buttons}
     try:
-        return api("sendMessage", _reply({"chat_id": chat_id, "text": text[:4000],
-                                          "disable_web_page_preview": "true"}, reply_to))
+        return api("sendMessage", _reply(p, reply_to))
     except Exception as e:
         print(f"sendMessage failed: {e}", file=sys.stderr)
 
@@ -178,7 +190,7 @@ def download(file_id, dest):
 
 def get_updates(offset=None, wait=0):
     """wait > 0 = long polling: Telegram holds the request until a message arrives."""
-    p = {"timeout": wait, "allowed_updates": ["message", "channel_post"]}
+    p = {"timeout": wait, "allowed_updates": UPDATES}
     if offset is not None:
         p["offset"] = offset
     return api("getUpdates", p, timeout=wait + 30)
@@ -292,7 +304,7 @@ def cmd_arm():
         return
     try:
         api("setWebhook", {"url": hook, "secret_token": webhook_secret(), "max_connections": 1,
-                           "allowed_updates": ["message", "channel_post"]})
+                           "allowed_updates": UPDATES})
         print("webhook reconnected")
     except Exception as e:
         print(f"could not reconnect webhook: {e}", file=sys.stderr)
@@ -404,6 +416,7 @@ def build(chat_id, job, workdir):
         cmd.append("--hide-candidate")
     if flags["nowm"]:
         cmd += ["--watermark", "off"]
+    cmd += ["--jobs", str(max(1, (os.cpu_count() or 2) // MAX_PARALLEL))]
 
     # output is captured, not printed, so public Action logs don't show names or roll numbers
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
@@ -454,9 +467,325 @@ def build(chat_id, job, workdir):
     print(f"sent {len(docs)} file(s){' + marks photo' if photo else ''}")
 
 
+def _msg_of(u):
+    return u.get("message") or u.get("channel_post")
+
+
 def _is_input(m):
     txt = m.get("text") or m.get("caption") or ""
     return bool(m.get("document")) or bool(re.search(r"https?://", txt))
+
+
+# --------------------------------------------------------------------------
+# Channel join gate
+# --------------------------------------------------------------------------
+
+_member_cache = {}
+_gate_warned = [False]
+
+
+def join_channel():
+    import settings as S
+    return (S.load().get("force_join") or "").strip()
+
+
+def join_link(ch):
+    return f"https://t.me/{ch.lstrip('@')}" if ch.startswith("@") else ""
+
+
+def is_member(user_id):
+    """True if the user has joined the force_join channel (or no channel is set)."""
+    ch = join_channel()
+    if not ch or str(user_id) in ADMINS:
+        return True
+    now = time.time()
+    hit = _member_cache.get(user_id)
+    if hit and now < hit[1]:
+        return hit[0]
+    try:
+        r = api("getChatMember", {"chat_id": ch, "user_id": user_id})
+        ok = r.get("status") in ("creator", "administrator", "member") or \
+            (r.get("status") == "restricted" and r.get("is_member"))
+    except Exception as e:
+        # bot isn't admin in the channel or the channel is wrong: don't lock everyone out
+        if not _gate_warned[0]:
+            _gate_warned[0] = True
+            print(f"join check failed ({e}); letting users through", file=sys.stderr)
+            log_safe(api, "sendMessage", {"chat_id": LOG_CHAT, "text":
+                     f"⚠️ Channel join check isn't working for {ch}: {e}\n"
+                     "Make the bot an admin of that channel, or /set force_join off."})
+        return True
+    _member_cache[user_id] = (ok, now + (600 if ok else 15))
+    return ok
+
+
+def join_prompt(chat_id, reply_to=None, held=False):
+    ch = join_channel()
+    import settings as S
+    name = S.load().get("channel_name") or ch
+    text = (f"🔒 Bot use karne ke liye pehle hamara channel join karo: {ch}\n\n"
+            "Join karke neeche ✅ button dabao."
+            + ("\n\n📎 Aapki file sambhal kar rakhi hai — join karte hi PDF banni shuru ho jayegi." if held else ""))
+    buttons = []
+    if join_link(ch):
+        buttons.append([{"text": f"📢 Join {name}", "url": join_link(ch)}])
+    buttons.append([{"text": "✅ Maine join kar liya", "callback_data": "joined"}])
+    send_message(chat_id, text, reply_to, buttons)
+
+
+# --------------------------------------------------------------------------
+# Dispatcher: collects files per person, queue, N workers
+# --------------------------------------------------------------------------
+
+def _new_job(m, chat_id, chat_type):
+    return {"files": [], "links": [], "flags": parse_flags(""), "modes": set(), "reply_to": None,
+            "message_ids": [], "who": who(m), "user_id": (m.get("from") or {}).get("id"),
+            "chat_id": chat_id, "chat_type": chat_type, "last": time.time()}
+
+
+class Dispatcher:
+    def __init__(self, parallel=MAX_PARALLEL, persistent=False):
+        self.parallel = parallel
+        self.persistent = persistent          # server mode: keeps waiting jobs across time
+        self.pending = {}                     # chat_id -> job still collecting files
+        self.held = {}                        # chat_id -> job waiting for channel join
+        self.waiting = []                     # queued jobs, in order
+        self.active = {}                      # chat_id -> job being built
+        self.lock = threading.Lock()
+        self.cv = threading.Condition(self.lock)
+        self.workers = []
+
+    # ---- queue bookkeeping
+    def position(self, chat_id):
+        with self.lock:
+            if chat_id in self.active:
+                return 0
+            for i, j in enumerate(self.waiting, 1):
+                if j["chat_id"] == chat_id:
+                    return max(1, i - max(0, self.parallel - len(self.active)))
+        return None
+
+    def queued_count(self, chat_id):
+        with self.lock:
+            return sum(1 for j in self.waiting if j["chat_id"] == chat_id) + (1 if chat_id in self.active else 0)
+
+    def enqueue(self, job):
+        with self.lock:
+            # same person still waiting in line: merge instead of a second place
+            for j in self.waiting:
+                if j["chat_id"] == job["chat_id"]:
+                    j["files"] += job["files"]
+                    j["links"] += job["links"]
+                    j["modes"] |= job["modes"]
+                    j["message_ids"] += job["message_ids"]
+                    return
+            self.waiting.append(job)
+            free = max(0, self.parallel - len(self.active))
+            ahead = len(self.waiting) - 1 - free            # people really in front of this one
+            job["had_to_wait"] = ahead >= 0
+            self.cv.notify()
+        n = len(job["files"]) + len(job["links"])
+        what = f"{n} file" if job["files"] else f"{n} link"
+        if job["had_to_wait"]:
+            send_message(job["chat_id"], f"🕐 {what} mil gayi. Abhi bheed hai — queue mein aapka number: {ahead + 1}.\n"
+                                         "Baari aate hi PDF banni shuru hogi. /queue se number dekh sakte ho.", job["reply_to"])
+        else:
+            send_message(job["chat_id"], f"⏳ {what} mil gayi. PDF ban rahi hai… (lagbhag 1 minute har part)", job["reply_to"])
+
+    def promote(self, force=False):
+        """Move people who stopped sending files into the queue."""
+        now = time.time()
+        ready = []
+        with self.lock:
+            for cid, j in list(self.pending.items()):
+                if force or now - j["last"] >= QUIET_SECONDS:
+                    ready.append(self.pending.pop(cid))
+        for j in ready:
+            if j["files"] or j["links"]:
+                self.enqueue(j)
+            elif j["modes"]:
+                send_message(j["chat_id"], "📎 Ab apni response sheet ki file ya link bhejo "
+                                           "(command caption mein bhi likh sakte ho).", j["reply_to"])
+
+    # ---- workers
+    def start(self):
+        for i in range(self.parallel):
+            t = threading.Thread(target=self._work, name=f"worker{i + 1}", daemon=True)
+            t.start()
+            self.workers.append(t)
+
+    def _next(self, block=True):
+        with self.cv:
+            while not self.waiting:
+                if not block:
+                    return None
+                self.cv.wait(5)
+            job = self.waiting.pop(0)
+            self.active[job["chat_id"]] = job
+            return job
+
+    def _work(self, block=True):
+        while True:
+            job = self._next(block)
+            if job is None:
+                return
+            try:
+                if job.get("had_to_wait"):
+                    send_message(job["chat_id"], "🚀 Aapki baari aa gayi! PDF ban rahi hai…", job["reply_to"])
+                log_request(job)
+                with tempfile.TemporaryDirectory() as wd:
+                    build(job["chat_id"], job, wd)
+            except Exception as e:
+                send_message(job["chat_id"], f"❌ Kuch gadbad ho gayi: {e}", job["reply_to"])
+                log_safe(api, "sendMessage", {"chat_id": LOG_CHAT, "text": f"❌ Error for {job['who']}: {e}"[:1000]})
+                print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+            finally:
+                with self.lock:
+                    self.active.pop(job["chat_id"], None)
+
+    def drain(self):
+        """GitHub mode: serve everyone in line with N parallel workers, then return."""
+        threads = [threading.Thread(target=self._work, args=(False,)) for _ in range(self.parallel)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    # ---- incoming updates
+    def feed(self, u):
+        if u.get("callback_query"):
+            return self.on_button(u["callback_query"])
+        m = _msg_of(u)
+        if not m:
+            return
+        chat_id = str(m["chat"]["id"])
+        chat_type = m["chat"].get("type", "private")
+        text = (m.get("text") or m.get("caption") or "").strip()
+        first = text.split(None, 1)[0].lower().split("@")[0] if text else ""
+        uid = (m.get("from") or {}).get("id")
+        gate = chat_type == "private" and uid and not is_admin(m, chat_id)
+
+        if first in ("/start", "/help", "/id"):
+            extra = f"\n\n🆔 Chat id: {chat_id}" + (f" · your id: {uid}" if uid else "")
+            send_message(chat_id, HELP + extra, m.get("message_id"))
+            if gate and not is_member(uid):
+                join_prompt(chat_id)
+            return
+        if first in ("/set", "/settings", "/reset"):
+            return settings_command(chat_id, text, m)
+        if first == "/queue":
+            pos = self.position(chat_id)
+            msg = ("🚀 Aapki PDF abhi ban rahi hai." if pos == 0 else
+                   f"🕐 Queue mein aapka number: {pos}." if pos else
+                   "✅ Aap queue mein nahi ho. File ya link bhejo.")
+            return send_message(chat_id, msg, m.get("message_id"))
+        if not allowed_chat(m, chat_id, chat_type):
+            if chat_type == "private":
+                send_message(chat_id, "🔒 Yeh bot abhi private hai.", m.get("message_id"))
+            return
+
+        # links: only SSC exam sites
+        links, bad = [], []
+        for url in re.findall(r"https?://\S+", text):
+            url = url.rstrip(").,>]'\"")
+            (links if self._link_ok(url) else bad).append(url)
+        if bad and not links and not m.get("document"):
+            send_message(chat_id, "❌ Yeh SSC response sheet ka link nahi lagta. "
+                                  "ssc.gov.in / cbexams.com wala link bhejo, ya saved page file.", m.get("message_id"))
+
+        doc = m.get("document")
+        file_ok = False
+        if doc:
+            name = doc.get("file_name") or "page.mhtml"
+            mime = (doc.get("mime_type") or "").lower()
+            ext = os.path.splitext(name.lower())[1]
+            file_ok = (ext in FILE_EXT or ext == "" or "mhtml" in mime or "multipart" in mime
+                       or mime in ("text/plain", "text/html", "application/octet-stream", "message/rfc822"))
+            if not file_ok:
+                send_message(chat_id, f"❌ {name} nahi padh sakta. Response sheet ka link bhejo, "
+                                      "ya Chrome mein ⋮ → ↓ se save ki hui page file.", m.get("message_id"))
+        if m.get("photo"):
+            send_message(chat_id, "📷 Photo/screenshot se nahi ban sakta. Response sheet ka link bhejo, "
+                                  "ya Chrome mein ⋮ → ↓ se save ki hui page file.", m.get("message_id"))
+
+        modes = parse_modes(text)
+        if not (file_ok or links or modes):
+            return
+        if self.queued_count(chat_id) >= MAX_QUEUED_PER_USER and (file_ok or links):
+            return send_message(chat_id, "✋ Aapki pichhli request abhi line mein hai. Woh poori hone do.", m.get("message_id"))
+
+        member = (not gate) or not (file_ok or links) or is_member(uid)
+        with self.lock:
+            if member and chat_id in self.held:          # joined meanwhile: release the held files
+                self.pending[chat_id] = self.held.pop(chat_id)
+            store = self.held if (chat_id in self.held) else self.pending
+            job = store.setdefault(chat_id, _new_job(m, chat_id, chat_type))
+        if file_ok:
+            job["files"].append((doc["file_id"], doc.get("file_name") or "page", doc.get("file_size")))
+            job["message_ids"].append(m["message_id"])
+        if links:
+            job["links"] += links
+            job["message_ids"].append(m["message_id"])
+        job["reply_to"] = job["reply_to"] or m.get("message_id")
+        job["modes"] |= modes
+        for k, v in parse_flags(text).items():
+            job["flags"][k] = job["flags"][k] or v
+        job["last"] = time.time()
+
+        if not member:
+            with self.lock:
+                if self.pending.get(chat_id) is job:
+                    self.pending.pop(chat_id)
+                first_hold = chat_id not in self.held
+                self.held[chat_id] = job
+            if first_hold:
+                if self.persistent:
+                    join_prompt(chat_id, m.get("message_id"), held=True)
+                else:
+                    join_prompt(chat_id, m.get("message_id"))
+                    send_message(chat_id, "Join karne ke baad file/link dobara bhejna.")
+            return
+        if (file_ok or links) and len(job["files"]) + len(job["links"]) == 1 and self.persistent:
+            send_message(chat_id, f"📥 Mil gaya. Baaki parts ho to bhej do — {QUIET_SECONDS} sec baad shuru karunga.",
+                         m.get("message_id"))
+
+    def _link_ok(self, url):
+        try:
+            import ssc_report
+            return ssc_report.link_allowed(url)
+        except Exception:
+            return False
+
+    def on_button(self, cq):
+        uid = (cq.get("from") or {}).get("id")
+        msg = cq.get("message") or {}
+        chat_id = str((msg.get("chat") or {}).get("id", uid))
+        if cq.get("data") != "joined":
+            return log_safe_ok(api, "answerCallbackQuery", {"callback_query_id": cq["id"]})
+        _member_cache.pop(uid, None)
+        if is_member(uid):
+            log_safe_ok(api, "answerCallbackQuery", {"callback_query_id": cq["id"], "text": "✅ Welcome!"})
+            log_safe_ok(api, "editMessageText", {"chat_id": chat_id, "message_id": msg.get("message_id"),
+                                                 "text": "✅ Channel join ho gaya. Shukriya!"})
+            with self.lock:
+                job = self.held.pop(chat_id, None)
+            if job and (job["files"] or job["links"]):
+                job["last"] = 0
+                with self.lock:
+                    self.pending[chat_id] = job
+                self.promote()
+            else:
+                send_message(chat_id, "Ab apni response sheet ka link ya file bhejo 📎")
+        else:
+            log_safe_ok(api, "answerCallbackQuery", {"callback_query_id": cq["id"], "show_alert": "true",
+                                                     "text": "❌ Abhi join nahi dikh raha. Pehle channel join karo, phir dobara dabao."})
+
+
+def log_safe_ok(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except Exception as e:
+        print(f"telegram: {e}", file=sys.stderr)
 
 
 def wait_until_quiet():
@@ -464,13 +793,26 @@ def wait_until_quiet():
     start = time.time()
     while True:
         ups = get_updates()
-        newest = max(((u.get("message") or u.get("channel_post") or {}).get("date", 0)
-                      for u in ups if _is_input(u.get("message") or u.get("channel_post") or {})), default=0)
+        newest = max(((_msg_of(u) or {}).get("date", 0)
+                      for u in ups if _is_input(_msg_of(u) or {})), default=0)
         wait = newest + QUIET_SECONDS - time.time()
         if not newest or wait <= 0 or time.time() - start > MAX_WAIT:
             return ups
         print(f"waiting {int(wait)}s for more files")
         time.sleep(min(wait, 60) + 1)
+
+
+def handle(updates, dispatcher=None):
+    """GitHub mode: take a batch of updates, serve everyone, return."""
+    get_updates(offset=updates[-1]["update_id"] + 1)     # confirm first: a crash can't loop on the same file
+    d = dispatcher or Dispatcher(persistent=False)
+    for u in updates:
+        try:
+            d.feed(u)
+        except Exception as e:
+            print(f"update failed: {e}", file=sys.stderr)
+    d.promote(force=True)
+    d.drain()
 
 
 def cmd_poll():
@@ -494,91 +836,28 @@ def cmd_poll():
             return
 
 
-def handle(updates):
-    # confirm right away so a crash can't make the bot process the same file forever
-    get_updates(offset=updates[-1]["update_id"] + 1)
-
-    jobs = {}   # chat_id -> job
-    for u in updates:
-        m = u.get("message") or u.get("channel_post")
-        if not m:
-            continue
-        chat_id = str(m["chat"]["id"])
-        chat_type = m["chat"].get("type", "private")
-        text = (m.get("text") or m.get("caption") or "").strip()
-        first = text.split(None, 1)[0].lower().split("@")[0] if text else ""
-        if first in ("/start", "/help", "/id"):
-            extra = f"\n\n🆔 Chat id: {chat_id}" + (f" · your id: {m['from']['id']}" if m.get("from") else "")
-            send_message(chat_id, HELP + extra, m.get("message_id"))
-            continue
-        if first in ("/set", "/settings", "/reset"):
-            settings_command(chat_id, text, m)
-            continue
-        if not allowed_chat(m, chat_id, chat_type):
-            if chat_type == "private":
-                send_message(chat_id, "🔒 Yeh bot abhi private hai.", m.get("message_id"))
-            continue
-        job = jobs.setdefault(chat_id, {"files": [], "links": [], "flags": parse_flags(""), "modes": set(),
-                                        "reply_to": None, "message_ids": [], "who": who(m),
-                                        "chat_id": chat_id, "chat_type": chat_type})
-        doc = m.get("document")
-        if doc:
-            name = doc.get("file_name") or "page.mhtml"
-            mime = (doc.get("mime_type") or "").lower()
-            ext = os.path.splitext(name.lower())[1]
-            looks_ok = (ext in FILE_EXT or ext == "" or "mhtml" in mime or "multipart" in mime
-                        or mime in ("text/plain", "text/html", "application/octet-stream", "message/rfc822"))
-            if looks_ok:
-                job["files"].append((doc["file_id"], name, doc.get("file_size")))
-                job["reply_to"] = job["reply_to"] or m.get("message_id")
-                job["message_ids"].append(m["message_id"])
-            else:
-                send_message(chat_id, f"❌ {name} nahi padh sakta. Chrome mein ⋮ → ↓ se save ki hui page file bhejo.",
-                             m.get("message_id"))
-        found = re.findall(r"https?://\S+", text)
-        if found:
-            job["links"] += found
-            job["reply_to"] = job["reply_to"] or m.get("message_id")
-            job["message_ids"].append(m["message_id"])
-        job["modes"] |= parse_modes(text)
-        for k, v in parse_flags(text).items():
-            job["flags"][k] = job["flags"][k] or v
-        if not doc and not found and job["modes"] and not job["files"]:
-            job["reply_to"] = job["reply_to"] or m.get("message_id")
-
-    todo = [(c, j) for c, j in jobs.items() if j["files"] or j["links"]]
-    for c, j in jobs.items():
-        if not (j["files"] or j["links"]) and j["modes"]:
-            send_message(c, "📎 Ab apni response sheet ki file bhejo (isi command ke caption ke saath bhi bhej sakte ho).",
-                         j["reply_to"])
-    for pos, (chat_id, job) in enumerate(todo, 1):
-        n = len(job["files"]) + len(job["links"])
-        queue = f"\nQueue mein aapse pehle {pos - 1} log hain." if pos > 1 else ""
-        send_message(chat_id, f"⏳ {n} file mil gayi. PDF ban rahi hai… (lagbhag 1 minute har part){queue}", job["reply_to"])
-    for chat_id, job in todo:
-        log_request(job)
-        with tempfile.TemporaryDirectory() as wd:
-            try:
-                build(chat_id, job, wd)
-            except Exception as e:
-                send_message(chat_id, f"❌ Kuch gadbad ho gayi: {e}", job["reply_to"])
-                log_safe(api, "sendMessage", {"chat_id": LOG_CHAT, "text": f"❌ Error for {job['who']}: {e}"[:1000]})
-                print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
-
-
 def cmd_serve():
-    """Run forever on your own server: replies within about a minute."""
+    """Run forever on your own server: instant replies, queue with MAX_PARALLEL workers."""
     need_token()
     try:
         api("deleteWebhook")
     except Exception:
         pass
-    print(f"bot running · public={PUBLIC} · waits {QUIET_SECONDS}s after the last file · admins: {len(ADMINS)}", flush=True)
-    errors = 0
+    d = Dispatcher(persistent=True)
+    d.start()
+    print(f"bot running · public={PUBLIC} · {MAX_PARALLEL} at a time · waits {QUIET_SECONDS}s after the last file · "
+          f"join: {join_channel() or 'off'}", flush=True)
+    offset, errors = None, 0
     while True:
         try:
-            if get_updates(wait=50):          # returns as soon as someone sends something
-                cmd_poll()
+            ups = get_updates(offset=offset, wait=10)
+            for u in ups:
+                offset = u["update_id"] + 1
+                try:
+                    d.feed(u)
+                except Exception as e:
+                    print(f"update failed: {e}", file=sys.stderr, flush=True)
+            d.promote()
             errors = 0
         except KeyboardInterrupt:
             raise

@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field, asdict
 from email import policy
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -149,39 +150,84 @@ def load_html_file(path, store):
     return html, None
 
 
+ALLOWED_LINK_HOSTS = [h.strip().lower() for h in os.environ.get(
+    "ALLOWED_LINK_HOSTS", "ssc.gov.in,ssc.nic.in,cbexams.com,digialm.com").split(",") if h.strip()]
+
+
+def link_allowed(url):
+    """Only SSC exam sites, over http(s), never private/internal addresses."""
+    import ipaddress
+    import socket
+    p = urlsplit(url)
+    host = (p.hostname or "").lower()
+    if p.scheme not in ("http", "https") or not host:
+        return False
+    if "*" not in ALLOWED_LINK_HOSTS and not any(host == h or host.endswith("." + h) for h in ALLOWED_LINK_HOSTS):
+        return False
+    try:
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+    except socket.gaierror:
+        return False
+    return True
+
+
 def load_url(url, store):
     import requests
+    from concurrent.futures import ThreadPoolExecutor
+    if not link_allowed(url):
+        raise RuntimeError("Only SSC response sheet links are accepted (ssc.gov.in / cbexams.com / digialm.com).")
     s = requests.Session()
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/128.0 Mobile Safari/537.36"),
         "Accept-Language": "en-IN,en;q=0.9",
     })
-    try:
-        r = s.get(url, timeout=60)
-        r.raise_for_status()
-    except Exception as e:
+    last = None
+    for attempt in range(3):
+        try:
+            r = s.get(url, timeout=45)
+            r.raise_for_status()
+            break
+        except Exception as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    else:
         raise RuntimeError(
-            f"Could not open the link ({e}).\n"
-            "The SSC site may block servers outside India or the link may have expired.\n"
-            "Fix: save the page as .mhtml in Chrome and put it in the input/ folder instead."
+            f"Could not open the link ({last}).\n"
+            "It may have expired or the SSC site is busy. Try again, or send the saved page file instead."
         )
+    if not link_allowed(r.url):
+        raise RuntimeError("The link redirected to a site that isn't an SSC exam site.")
     html = r.text
     if "Q.No" not in html:
         raise RuntimeError(
-            "The link opened, but it doesn't look like a response sheet (no questions found).\n"
-            "It may need a login. Save the page as .mhtml in Chrome and use the input/ folder instead."
+            "The link opened, but no questions were found on it (it may need a login or has expired).\n"
+            "Send the saved page file instead (Chrome ⋮ → ↓)."
         )
-    srcs = set(re.findall(r'<img[^>]+src="([^"]+)"', html))
-    for src in srcs:
+    srcs = sorted(set(re.findall(r'<img[^>]+src="([^"]+)"', html)))
+
+    def grab(src):
         full = urljoin(r.url, src)
-        try:
-            ir = s.get(full, timeout=60, headers={"Referer": r.url})
-            if ir.ok:
-                store.add(src, ir.content)
-                store.add(full, ir.content)
-        except Exception:
-            pass
+        if not link_allowed(full):
+            return src, full, None
+        for attempt in range(3):
+            try:
+                ir = s.get(full, timeout=30, headers={"Referer": r.url})
+                if ir.ok and ir.content:
+                    return src, full, ir.content
+            except Exception:
+                pass
+            time.sleep(1 + attempt)
+        return src, full, None
+
+    with ThreadPoolExecutor(16) as ex:
+        for src, full, blob in ex.map(grab, srcs):
+            if blob:
+                store.add(src, blob)
+                store.add(full, blob)
     return html, r.url
 
 
@@ -553,6 +599,17 @@ def _ocr_job(job):
         return key, OcrResult(False, "", "", 0, f"error {e}")
 
 
+def choose_language(questions, store, lang="en"):
+    """Bilingual papers carry an English and a Hindi picture per cell: keep one (settings 'language')."""
+    from img_tools import pick_images
+    for q in questions:
+        q.q_imgs = pick_images(q.q_imgs, store, lang)
+        q.q_img = q.q_imgs[0] if q.q_imgs else None
+        for o in q.options:
+            o.imgs = pick_images(o.imgs, store, lang)
+            o.img = o.imgs[0] if o.imgs else None
+
+
 def run_ocr(questions, store, jobs=0):
     from multiprocessing import Pool
     todo, seen = [], set()
@@ -562,8 +619,18 @@ def run_ocr(questions, store, jobs=0):
                 seen.add(key)
                 todo.append((key, store.get(key), single))
     n = jobs or os.cpu_count() or 2
+    show = os.environ.get("OCR_PROGRESS") == "1"
+    out = {}
     with Pool(n) as pool:
-        return dict(pool.map(_ocr_job, todo, chunksize=8))
+        for i, (k, r) in enumerate(pool.imap_unordered(_ocr_job, todo, chunksize=4), 1):
+            out[k] = r
+            if show and (i % 10 == 0 or i == len(todo)):
+                bar = "#" * int(24 * i / len(todo))
+                sys.stderr.write(f"\r   Reading photos  [{bar:<24}] {i}/{len(todo)}")
+                sys.stderr.flush()
+    if show and todo:
+        sys.stderr.write("\n")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -605,7 +672,7 @@ def gather_inputs(args):
     return sorted(set(files)), links
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("files", nargs="*", help=".mhtml / .html response sheet files")
     ap.add_argument("--links", default="", help="response sheet link(s), separated by spaces or commas")
@@ -626,7 +693,7 @@ def main():
                     help="paper style outputs, comma separated: sections, full, marks (default all three)")
     ap.add_argument("--settings", default="", help="settings.json with colours / watermark / channel (default: next to this script)")
     ap.add_argument("--summary", default="", help="append a Markdown summary to this file (GitHub step summary)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     files, links = gather_inputs(args)
     if not files and not links:
@@ -718,6 +785,7 @@ def main():
             st["watermark"] = "" if args.watermark.lower() in ("none", "off") else args.watermark
         make = {m.strip() for m in args.make.split(",") if m.strip()}
         if make & {"sections", "full"}:
+            choose_language(questions, store, st.get("language", "en"))
             from paper_pdf import build_paper
             ocr = run_ocr(questions, store, args.jobs)
             fails = [k for k, r in ocr.items() if not r.ok]

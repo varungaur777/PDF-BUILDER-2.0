@@ -7,6 +7,7 @@ services:
     env_file: .env
     environment:
       QUIET_SECONDS: "45"        # wait this long after your last file, then build one PDF
+      MAX_PARALLEL: "${MAX_PARALLEL:-2}"   # people served at the same time; the rest wait in a queue
       TZ: Asia/Kolkata
     volumes:
       - ./settings.json:/app/settings.json      # /set changes survive restarts

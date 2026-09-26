@@ -8,6 +8,8 @@ import os
 import re
 
 from PIL import Image as PILImage
+
+from img_tools import line_height, reflow, trim
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -29,7 +31,9 @@ GREEN = colors.HexColor("#1E7D34")
 
 LETTERS = "abcdefgh"
 
+_BUNDLED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fonts")
 _FONT_CANDIDATES = [
+    tuple(os.path.join(_BUNDLED, f"LiberationSerif-{w}.ttf") for w in ("Regular", "Bold", "Italic", "BoldItalic")),
     ("/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
      "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
      "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
@@ -96,7 +100,7 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
     A_COL = _hex(S.get("answer_color"), BLUE)
     ACC = _hex(S.get("accent_color"), BLUE)
     WM_COL = _hex(S.get("watermark_color"), colors.HexColor("#DB3333"))
-    WM_ALPHA = float(S.get("watermark_opacity", 0.13) or 0.13)
+    WM_ALPHA = float(S.get("watermark_opacity", 0.08) or 0.08)
     WM = (S.get("watermark") or "").strip()
     FS = float(S.get("font_size", 9.4) or 9.4)
     TITLE = S.get("header_title") or "Staff Selection Commission"
@@ -118,22 +122,82 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
     ANS = ParagraphStyle("A", fontName=FONT_B, fontSize=FS - 0.4, leading=FS * 1.17, textColor=A_COL)
     BAR = ParagraphStyle("BAR", fontName=FONT_B, fontSize=10.5, leading=13, textColor=INK)
 
+    LANG = (S.get("language") or "en").lower()
+    _trimmed = {}
+    _scales = {}
+
+    def text_scale(reason):
+        if reason not in _scales:
+            hs = sorted(h for h in (line_height(store.get(k)) for k, r in ocr.items()
+                                    if r.reason == reason and store.get(k)) if h)
+            band = FS * (1.38 if reason == "hindi" else 1.3)
+            _scales[reason] = band / hs[len(hs) // 2] if hs else None
+        return _scales[reason]
+
     def img_flow(key, max_w, max_h=110 * mm):
         blob = store.get(key)
         if not blob:
             return None
+        r = ocr.get(key)
+        if r is not None and r.reason == "hindi":
+            # text kept as a picture: re-wrap it to the column at the size of the typed text,
+            # one scale for the whole paper so every Hindi line comes out the same size
+            got = reflow(blob, max_w, scale=text_scale(r.reason), lo_pt=FS * 1.2, hi_pt=FS * 1.6)
+            if got:
+                data, w, h = got
+                if h <= max_h:
+                    return Image(io.BytesIO(data), width=w, height=h, hAlign="LEFT")
+        if key not in _trimmed:
+            _trimmed[key] = trim(blob)
+        blob = _trimmed[key]
         w, h = PILImage.open(io.BytesIO(blob)).size
         scale = min(0.62, max_w / w)
         if h * scale > max_h:
             scale = max_h / h
         return Image(io.BytesIO(blob), width=w * scale, height=h * scale, hAlign="LEFT")
 
+    def _pic_size(k):
+        try:
+            return PILImage.open(io.BytesIO(_trimmed.setdefault(k, trim(store.get(k))))).size
+        except Exception:
+            return None
+
+    def one_language(keys):
+        """Fallback when the image names don't say the language: drop the other-language copies."""
+        keys = [k for k in keys or [] if k]
+        if LANG == "both" or len(keys) < 2:
+            return keys
+        res = {k: ocr.get(k) for k in keys}
+        hin = [k for k in keys if res[k] is not None and res[k].reason == "hindi"]
+        other = [k for k in keys if k not in hin]
+        if hin and other:
+            if LANG == "en":
+                keys = other
+            else:                      # hi: keep Hindi + pictures, drop the typed English copy
+                keys = [k for k in keys if k in hin or res[k] is None or not res[k].ok]
+        # EN figure(s) followed by the same number of HI figure(s) of the same size -> keep one set
+        pics = [k for k in keys if res.get(k) is None or not res[k].ok]
+        if len(pics) == len(keys) and len(keys) % 2 == 0:
+            n = len(keys) // 2
+            a, b = keys[:n], keys[n:]
+            sizes = [(_pic_size(x), _pic_size(y)) for x, y in zip(a, b)]
+            if all(p and q and abs(p[0] - q[0]) <= 0.1 * max(p[0], q[0]) and abs(p[1] - q[1]) <= 0.15 * max(p[1], q[1])
+                   for p, q in sizes):
+                keys = b if LANG == "hi" else a
+        return keys
+
     def parts_of(keys, fallback_text=""):
         """[(markup or None, key)] for every picture in a cell; None = keep the picture."""
-        out = []
-        for k in keys or []:
+        out, seen = [], set()
+        for k in one_language(keys):
             r = ocr.get(k)
-            out.append((r.markup if (r and r.ok) else None, k))
+            txt = r.markup if (r and r.ok) else None
+            if txt is not None:
+                n = _norm(txt)
+                if n in seen:          # same words twice (English + Hindi picture of a number)
+                    continue
+                seen.add(n)
+            out.append((txt, k))
         if not out and fallback_text:
             out.append((_esc(fallback_text), None))
         return out
@@ -141,35 +205,39 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
     # ---------------- page furniture
     def header_box(canvas):
         x, y, w, h = M, top_y - head_h + 3 * mm, page_w - 2 * M, head_h - 3 * mm
-        canvas.setStrokeColor(ACC); canvas.setLineWidth(1.4)
-        canvas.roundRect(x, y, w, h, 4, stroke=1, fill=0)
-        canvas.setFillColor(INK)
-        canvas.setFont(FONT_B, 13)
+        canvas.setFillColor(ACC)
+        canvas.roundRect(x, y, w, h, 6, stroke=0, fill=1)
+        # darker right panel
+        canvas.setFillColor(colors.Color(ACC.red * 0.7, ACC.green * 0.7, ACC.blue * 0.7))
+        rx = x + w - 66 * mm
+        canvas.roundRect(rx - 4 * mm, y + 3 * mm, 66 * mm, h - 6 * mm, 5, stroke=0, fill=1)
+        canvas.setFillColor(colors.white)
+        canvas.setFont(FONT_B, 14)
         canvas.drawString(x + 6 * mm, y + h - 10 * mm, TITLE[:48])
-        canvas.setFont(FONT, 9)
-        canvas.drawString(x + 6 * mm, y + h - 15.5 * mm, (cand.exam or "SSC Examination")[:80])
-        canvas.setFont(FONT, 8)
-        canvas.setFillColor(GREY)
+        canvas.setFont(FONT, 9.5)
+        canvas.drawString(x + 6 * mm, y + h - 15.5 * mm, (cand.exam or "SSC Examination")[:78])
+        canvas.setFillColor(colors.Color(1, 1, 1, alpha=0.75)); canvas.setFont(FONT, 8)
         canvas.drawString(x + 6 * mm, y + h - 20.5 * mm, "Question paper with official answer key")
         if CH_NAME:
-            canvas.setFillColor(ACC); canvas.setFont(FONT_B, 8)
-            label = f"{CH_NAME}  ·  {CH_LINK.replace('https://', '')}" if CH_LINK else CH_NAME
-            canvas.drawString(x + 6 * mm, y + h - 25.5 * mm, label)
+            canvas.setFillColor(colors.white); canvas.setFont(FONT_B, 8.5)
+            label = f"Join {CH_NAME}  \u00b7  {CH_LINK.replace('https://', '')}" if CH_LINK else CH_NAME
+            canvas.drawString(x + 6 * mm, y + h - 26.5 * mm, label)
             if CH_LINK:
-                lw = pdfmetrics.stringWidth(label, FONT_B, 8)
-                canvas.linkURL(CH_LINK, (x + 6 * mm, y + h - 26.5 * mm, x + 6 * mm + lw, y + h - 23 * mm), relative=0)
-        rx = x + w - 62 * mm
-        canvas.setFillColor(ACC); canvas.setFont(FONT_B, 11)
-        canvas.drawString(rx, y + h - 8.5 * mm, "SSC Online Exam")
-        canvas.setFillColor(INK); canvas.setFont(FONT, 8.2)
-        rows = [("Date", cand.test_date), ("Shift", cand.shift)]
+                lw = pdfmetrics.stringWidth(label, FONT_B, 8.5)
+                canvas.linkURL(CH_LINK, (x + 6 * mm, y + h - 27.5 * mm, x + 6 * mm + lw, y + h - 24 * mm), relative=0)
+        canvas.setFillColor(colors.white); canvas.setFont(FONT_B, 10.5)
+        canvas.drawString(rx, y + h - 9 * mm, "SSC Online Exam")
+        date = " ".join(t.capitalize() if t.isalpha() else t for t in (cand.test_date or "").split())
+        rows = [("Date", date), ("Shift", cand.shift)]
         if not hide_candidate:
             rows += [("Roll No", cand.roll_no), ("Name", cand.name)]
-        yy = y + h - 14 * mm
+        yy = y + h - 14.5 * mm
         for k, v in rows:
-            canvas.setFont(FONT, 8.2); canvas.drawString(rx, yy, f"{k}:")
-            canvas.setFont(FONT_B, 8.2); canvas.drawString(rx + 14 * mm, yy, (v or "")[:34])
-            yy -= 4.3 * mm
+            canvas.setFillColor(colors.Color(1, 1, 1, alpha=0.75)); canvas.setFont(FONT, 8)
+            canvas.drawString(rx, yy, f"{k}")
+            canvas.setFillColor(colors.white); canvas.setFont(FONT_B, 8.2)
+            canvas.drawString(rx + 14 * mm, yy, (v or "")[:30])
+            yy -= 4.2 * mm
 
     def furniture(canvas, doc, first=False):
         canvas.saveState()
@@ -188,6 +256,10 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
                 canvas.rotate(42)
                 canvas.drawCentredString(0, -size / 3, WM)
                 canvas.restoreState()
+        # thin divider between the two columns
+        canvas.setStrokeColor(LINE); canvas.setLineWidth(0.5)
+        col_top = (top_y - head_h - bar_h - 2 * mm) if first else (top_y - 2 * mm)
+        canvas.line(page_w / 2, bottom, page_w / 2, col_top)
         # footer: channel name + clickable link
         foot = footer_text
         if not foot and CH_NAME:
@@ -252,7 +324,7 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
             items.append((lab, parts_of(o.imgs or ([o.img] if o.img else []), o.text)))
         all_text = all(p and all(t is not None for t, _ in p) for _, p in items)
         if all_text:
-            texts = [(lab, " / ".join(t for t, _ in p)) for lab, p in items]
+            texts = [(lab, " ".join(t for t, _ in p)) for lab, p in items]
             plain_len = max(len(_norm(t)) for _, t in texts)
             parts = [f"<font name='{FONT_B}'>({lab})</font> {t}" for lab, t in texts]
             if plain_len <= 12 and len(items) <= 4:
@@ -280,7 +352,7 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
                     rows.append(row)
                 t = Table(rows, colWidths=[8 * mm, half - 8 * mm] * 2, hAlign="LEFT")
                 t.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                                       ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+                                       ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
                 return [t]
         # at least one option is a picture (figure / Hindi): one row per option
         rows = []
@@ -339,7 +411,7 @@ def build_paper(path, cand, questions, store, ocr, *, show_yours=False, hide_can
                     block.append(Paragraph(label + ask, Q))
                 else:
                     last_passage = None
-                    block.append(Paragraph(label + first_txt, Q))
+                    block.append(Paragraph(label + re.sub(r"(<br/>\s*){2,}", "<br/>", first_txt), Q))
                 rest = parts[1:]
             else:
                 last_passage = None

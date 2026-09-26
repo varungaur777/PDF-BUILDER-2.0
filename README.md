@@ -9,6 +9,14 @@ File names: `12 Sep 2026 (English Language and Comprehension) (Shift-1).pdf`, fu
 English questions are typed out with OCR; figures, maths layouts and Hindi (or bilingual) questions/options are kept as the original picture.
 Every request is copied to the team's log channel (user name, @username, id, the files and the outputs). The bot tells users this in /start.
 
+## New in this version
+
+- **Channel join required:** users must join `force_join` (default `@NotesHubX`) first. They get a Join button and a "✅ Maine join kar liya" button; a file sent before joining is kept and processed right after joining (server mode). The bot must be an **admin of that channel** to check members. Team: `/set force_join off` to disable, `/set force_join @OtherChannel` to change.
+- **Queue:** `MAX_PARALLEL` people (default 2) are served at the same time, the rest wait in line and see their number; `/queue` shows it any time. One person can have at most 2 requests waiting.
+- **Links:** users can paste the response sheet link instead of a file. Only SSC exam sites are fetched (`ssc.gov.in`, `ssc.nic.in`, `cbexams.com`, `digialm.com`; change with `ALLOWED_LINK_HOSTS`). Works best from an Indian server.
+- Photos/screenshots are politely refused.
+- New marks photo design and a cleaner PDF header.
+
 ## Commands
 
 | Who | Send | Gets |
@@ -18,12 +26,16 @@ Every request is copied to the team's log channel (user name, @username, id, the
 | | caption `/full` | full paper only |
 | | caption `/sections` | section PDFs only |
 | | caption `/report` | analysis PDF (your wrong answers in red) |
+| | the response sheet **link** | same as a file |
+| | `/queue` | their place in line |
 | | words `yours` / `hide` / `nowm` | show your answer / no name & roll no. / no watermark |
 | Team (ids in `TELEGRAM_CHAT_ID`) | `/settings` | all settings |
 | | `/set <name> <value>` | e.g. `/set question_color #1E7D34`, `/set watermark off`, `/set channel_link t.me/NotesHubX` |
 | | `/reset` | back to defaults |
 
-Settings: `channel_name`, `channel_link` (footer + marks photo), `header_title`, `watermark`, `watermark_color`, `watermark_opacity`, `question_color`, `option_color`, `answer_color`, `accent_color`, `font_size`. They are saved in `settings.json` (committed back to the repo by the bot).
+Settings: `force_join`, `channel_name`, `channel_link` (footer + marks photo), `header_title`, `watermark`, `watermark_color`, `watermark_opacity`, `question_color`, `option_color`, `answer_color`, `accent_color`, `font_size`, `language`. They are saved in `settings.json` (committed back to the repo by the bot).
+
+**Bilingual papers:** SSC puts an English and a Hindi picture in every cell. The PDF keeps one: `/set language en` (default), `/set language hi` for Hindi, `/set language both` for both. Hindi text pictures are re-wrapped to the column so they are as easy to read as the typed text. A section that only exists in Hindi is always kept.
 
 ## Secrets (repo → Settings → Secrets and variables → Actions)
 
@@ -37,7 +49,7 @@ Settings: `channel_name`, `channel_link` (footer + marks photo), `header_title`,
 
 1. github.com → **+** → **New repository** → name `ssc-paper` → **Public** → **Create**.
 2. Upload everything from the zip, keeping the folders:
-   `ssc_report.py`, `ocr_text.py`, `paper_pdf.py`, `telegram_bot.py`, `requirements.txt`, `.github/workflows/telegram.yml`
+   `ssc_report.py`, `ocr_text.py`, `paper_pdf.py`, `img_tools.py`, `marks_card.py`, `settings.py`, `settings.json`, `telegram_bot.py`, `requirements.txt`, `.github/workflows/telegram.yml`
    - If folders won't upload: **Add file → Create new file**, type `.github/workflows/telegram.yml` as the name and paste its contents.
 3. **Actions** tab → enable workflows if asked.
 

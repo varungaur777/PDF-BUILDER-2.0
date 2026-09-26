@@ -19,17 +19,19 @@ PATH = os.environ.get("SETTINGS_FILE", os.path.join(HERE, "settings.json"))
 
 # key: (default, kind, help)
 SCHEMA = {
+    "force_join":        ("@NotesHubX", "channel", "users must join this channel before using the bot (off = anyone)"),
     "channel_name":      ("NotesHubX", "text", "channel name in the footer and on the marks photo"),
     "channel_link":      ("https://t.me/NotesHubX", "url", "channel link in the footer (clickable)"),
     "header_title":      ("Staff Selection Commission", "text", "big title in the PDF header"),
     "watermark":         ("@NotesHubX", "text", "diagonal watermark text (off = no watermark)"),
     "watermark_color":   ("#DB3333", "color", "watermark colour"),
-    "watermark_opacity": (0.13, "number:0.02-0.6", "watermark strength, 0.02 (faint) to 0.6 (dark)"),
+    "watermark_opacity": (0.08, "number:0.02-0.6", "watermark strength, 0.02 (faint) to 0.6 (dark)"),
     "question_color":    ("#B3261E", "color", "question text colour"),
     "option_color":      ("#1B1B1B", "color", "options text colour"),
     "answer_color":      ("#1F4E9E", "color", "'Answer: (b)' colour"),
     "accent_color":      ("#1F4E9E", "color", "header border, section bar and answer box line"),
     "font_size":         (9.4, "number:7-13", "question font size"),
+    "language":          ("en", "choice:en,hi,both", "bilingual papers: en = English only, hi = Hindi only, both = both"),
 }
 
 NAMED_COLORS = {
@@ -79,6 +81,21 @@ def validate(key, raw):
         if not lo <= v <= hi:
             return None, f"{key} must be between {lo:g} and {hi:g}."
         return v, None
+    if kind.startswith("choice"):
+        opts = kind.split(":")[1].split(",")
+        v = {"english": "en", "hindi": "hi", "eng": "en", "hin": "hi"}.get(raw.lower(), raw.lower())
+        if v in opts:
+            return v, None
+        return None, f"{key} must be one of: {', '.join(opts)}."
+    if kind == "channel":
+        if raw.lower() in ("off", "none", "-"):
+            return "", None
+        m = re.fullmatch(r"(?:https?://)?(?:t\.me/|telegram\.me/)?@?([A-Za-z][A-Za-z0-9_]{3,31})/?", raw)
+        if m:
+            return "@" + m.group(1), None
+        if re.fullmatch(r"-100\d{6,}", raw):
+            return raw, None
+        return None, "Use the channel @username (e.g. @NotesHubX), its t.me link, or its -100… id. off = no join check."
     if kind == "url":
         if raw.lower() in ("off", "none", "-"):
             return "", None

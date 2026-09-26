@@ -9,12 +9,32 @@ embed the picture instead.
 """
 
 import io
+import os
 import re
 from dataclasses import dataclass
 
 import numpy as np
 import pytesseract
 from PIL import Image, ImageOps
+
+def _find_tesseract():
+    """Windows/Mac installers often don't add tesseract to PATH; look in the usual places."""
+    import shutil
+    if shutil.which("tesseract"):
+        return
+    env = os.environ.get("TESSERACT_CMD", "")
+    candidates = [env] if env else []
+    candidates += [r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                   r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                   os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+                   "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"]
+    for c in candidates:
+        if c and os.path.exists(c):
+            pytesseract.pytesseract.tesseract_cmd = c
+            return
+
+
+_find_tesseract()
 
 PAD = 20
 SCALE = 3
@@ -116,12 +136,19 @@ def _hindi_available():
     return _HIN
 
 
-def has_devanagari(blob):
-    """True if the image contains Hindi (Devanagari) text."""
+def devanagari_score(blob):
+    """(number of Hindi letters, share of Hindi among all letters) read in the image."""
     if not _hindi_available():
-        return False
+        return 0, 0.0
     t = pytesseract.image_to_string(_prep(blob, 2), lang="eng+hin", config="--psm 6")
-    return len(re.findall(r"[\u0900-\u097F]", t)) >= 3
+    n = len(re.findall(r"[\u0900-\u097F]", t))
+    return n, n / max(1, len(re.sub(r"\s", "", t)))
+
+
+def has_devanagari(blob, strict=False):
+    """True if the image contains Hindi (Devanagari) text. strict: for pictures that may be figures."""
+    n, share = devanagari_score(blob)
+    return (n >= 4 and share >= 0.7) if strict else n >= 3
 
 
 def ocr_image(blob, single_line=False):
@@ -134,6 +161,22 @@ def ocr_image(blob, single_line=False):
     # Hindi / bilingual text can't be typed back correctly -> keep the original picture
     if r.ok and (r.conf < 93 or r.min_conf < 60) and has_devanagari(blob):
         return OcrResult(False, "", "", r.conf, "hindi")
+    if not r.ok and re.match(r"(low confidence|no text)", r.reason or "") and has_devanagari(blob):
+        return OcrResult(False, "", "", r.conf, "hindi")
+    if not r.ok and (r.reason or "").startswith("non-text ink") and r.conf < 60 and has_devanagari(blob, strict=True):
+        return OcrResult(False, "", "", r.conf, "hindi")
+    # number series / figures read with doubt: a wrong digit is worse than the picture
+    if r.ok:
+        shaky = (r.conf < 85 or r.min_conf < 50) if single_line else (r.conf < 93 or r.min_conf < 70)
+        numeric = False
+        for line in re.split(r"<br/>", r.markup or ""):
+            alnum = re.sub(r"[^0-9A-Za-z]", "", re.sub(r"<[^>]+>", "", line))
+            digits = sum(c.isdigit() for c in alnum)
+            garbled = re.search(r"\d[,.;:]{2,}", line)
+            if digits >= 4 and (digits >= 0.5 * len(alnum) or garbled):
+                numeric = numeric or bool(garbled) or shaky
+        if numeric:
+            return OcrResult(False, "", "", r.conf, "numbers")
     if single_line and (not r.ok or r.conf < 88 or re.fullmatch(r"[A-H\s\-–—=]{5,}", r.plain or "")):
         letters = _letter_order(_prep(blob))
         if letters:
@@ -231,7 +274,7 @@ def _ocr_image(blob, single_line=False, allow_bold=True, scale=None):
         for w in ws:
             w["b"] = bool(base_sw) and w["sw"] >= base_sw * 1.5 and not w.get("blank")
         real = [w for w in ws if not w.get("blank")]
-        if real and len(real) >= 4 and sum(len(w["t"]) for w in real if w["b"]) >= 0.5 * sum(len(w["t"]) for w in real):
+        if real and len(real) >= 4 and sum(len(w["t"]) for w in real if w["b"]) >= 0.34 * sum(len(w["t"]) for w in real):
             for w in real:            # a mostly-bold line is a bold line
                 w["b"] = True
 

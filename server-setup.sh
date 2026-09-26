@@ -34,6 +34,7 @@ if [ ! -f .env ] || [ "$1" = "config" ]; then
   ask TELEGRAM_CHAT_ID   "Team/admin id(s), comma separated" ""
   ask LOG_CHAT_ID        "Log channel id (blank = no log)" ""
   ask PUBLIC_BOT         "Public bot (anyone can use in DM): true/false" "true"
+  ask MAX_PARALLEL       "How many people at the same time (1-4, rest wait in queue)" "2"
   mv .env.new .env && chmod 600 .env
 fi
 
@@ -44,7 +45,8 @@ $DC up -d --build
 
 say "Done! The bot is running 24x7 and restarts by itself after a reboot."
 echo "IMPORTANT: on GitHub open Actions → Telegram bot → ⋯ → Disable workflow,"
-echo "           otherwise GitHub and the server fight over the same bot."
+echo "           and don't open the Vercel /api/telegram link any more (it reconnects the webhook)."
+echo "           Only one copy of the bot may run."
 echo
 echo "See what it's doing:  $DC logs -f --tail 50"
 echo "Update after changes: bash server-setup.sh"
